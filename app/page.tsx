@@ -3,7 +3,7 @@
 import React, { useState } from "react";
 
 const CONTRACT_ADDRESS = "0xD914f1eC67f29B0eA078A0A8d32b3c0461504754";
-const SCALE = 10n ** 18n;
+const SCALE = 1e18;
 
 interface Position {
   address: string;
