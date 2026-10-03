@@ -25,7 +25,6 @@ export default function CollateralGuardDashboard() {
     { msg: "Connected to GenLayer Testnet. Ready.", type: "info", time: "Just now" },
   ]);
 
-  // Sample initial accounts matching the contract state
   const [positions, setPositions] = useState<Position[]>([
     {
       address: "0x4edD...873a",
@@ -59,7 +58,6 @@ export default function CollateralGuardDashboard() {
     },
   ]);
 
-  // Modal forms state
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
   const [showCheckModal, setShowCheckModal] = useState<boolean>(false);
   const [modalAddress, setModalAddress] = useState<string>("");
@@ -71,14 +69,13 @@ export default function CollateralGuardDashboard() {
     setStatusLog((prev) => [{ msg, type, time: timeStr }, ...prev.slice(0, 9)]);
   };
 
-  // 1. add_monitored_account handler
   const handleAddAccount = (e: React.FormEvent) => {
     e.preventDefault();
     if (!modalAddress || !modalCollateral || !modalDebt) return;
 
     const coll = parseFloat(modalCollateral);
     const dbt = parseFloat(modalDebt);
-    const mockPriceWeth = 3200; // Simulated Oracle price
+    const mockPriceWeth = 3200; 
     const ratio = ((coll * mockPriceWeth) / dbt) * 100;
     const status: "SAFE" | "WARNING" | "CRITICAL" = ratio < globalThreshold ? "CRITICAL" : ratio < globalThreshold + 15 ? "WARNING" : "SAFE";
 
@@ -101,7 +98,6 @@ export default function CollateralGuardDashboard() {
     setModalDebt("");
   };
 
-  // 2. check_and_protect handler (Core Sentinel)
   const handleCheckAndProtect = (targetAddr: string) => {
     addLog(`Invoking check_and_protect(${targetAddr})... Strict oracle pull triggered.`, "info");
     
@@ -128,13 +124,11 @@ export default function CollateralGuardDashboard() {
     }, 700);
   };
 
-  // 3. unpause_protocol handler
   const handleUnpause = () => {
     setProtocolPaused(false);
     addLog("unpause_protocol() executed by owner. Circuit breaker reset.", "success");
   };
 
-  // 4. remove_monitored_account handler
   const handleRemove = (addr: string) => {
     setPositions(positions.filter((p) => p.address !== addr));
     addLog(`remove_monitored_account(${addr}) executed.`, "info");
@@ -142,10 +136,8 @@ export default function CollateralGuardDashboard() {
 
   return (
     <div className="flex h-screen bg-[#070b14] text-slate-100 font-sans overflow-hidden">
-      {/* LEFT SIDEBAR (Matching reference CRYZEN layout) */}
       <aside className="w-64 bg-[#0d1322] border-r border-slate-800/60 flex flex-col justify-between shrink-0">
         <div>
-          {/* Logo & Protocol Title */}
           <div className="p-6 flex items-center space-x-3 border-b border-slate-800/40">
             <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -158,7 +150,6 @@ export default function CollateralGuardDashboard() {
             </div>
           </div>
 
-          {/* Navigation Links */}
           <nav className="p-4 space-y-1">
             {[
               { id: "Dashboard", label: "Dashboard", icon: "M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" },
@@ -185,7 +176,6 @@ export default function CollateralGuardDashboard() {
           </nav>
         </div>
 
-        {/* Bottom Status Card */}
         <div className="p-4 m-4 rounded-xl bg-gradient-to-br from-blue-950/40 to-slate-900 border border-blue-800/30">
           <div className="flex items-center space-x-2 text-xs text-blue-400 font-semibold mb-1">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
@@ -195,9 +185,7 @@ export default function CollateralGuardDashboard() {
         </div>
       </aside>
 
-      {/* MAIN CONTENT AREA */}
       <main className="flex-1 flex flex-col overflow-y-auto">
-        {/* Top Navbar */}
         <header className="h-16 border-b border-slate-800/60 px-8 flex items-center justify-between bg-[#0b101b]/80 backdrop-blur shrink-0">
           <div>
             <h2 className="text-lg font-semibold text-white">CollateralGuard Sentinel</h2>
@@ -224,11 +212,8 @@ export default function CollateralGuardDashboard() {
           </div>
         </header>
 
-        {/* Dashboard Grid */}
         <div className="p-8 space-y-6 max-w-7xl">
-          {/* ROW 1: TOP METRICS & QUICK ACTIONS */}
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-            {/* Card 1: Total Value Monitored */}
             <div className="bg-[#0f1627] border border-slate-800/80 p-5 rounded-2xl relative overflow-hidden">
               <p className="text-xs font-medium text-slate-400">Total Monitored Value</p>
               <h3 className="text-2xl font-bold text-white mt-1">$142,880.00</h3>
@@ -237,7 +222,6 @@ export default function CollateralGuardDashboard() {
               </div>
             </div>
 
-            {/* Card 2: Global Threshold */}
             <div className="bg-[#0f1627] border border-slate-800/80 p-5 rounded-2xl relative overflow-hidden">
               <p className="text-xs font-medium text-slate-400">Liquidation Threshold</p>
               <h3 className="text-2xl font-bold text-white mt-1">{globalThreshold}%</h3>
@@ -246,7 +230,6 @@ export default function CollateralGuardDashboard() {
               </div>
             </div>
 
-            {/* Card 3: Positions Tracked */}
             <div className="bg-[#0f1627] border border-slate-800/80 p-5 rounded-2xl relative overflow-hidden">
               <p className="text-xs font-medium text-slate-400">Active Positions</p>
               <h3 className="text-2xl font-bold text-white mt-1">{positions.length} Total</h3>
@@ -257,7 +240,6 @@ export default function CollateralGuardDashboard() {
               </div>
             </div>
 
-            {/* Card 4: Quick Action Controls */}
             <div className="bg-[#0f1627] border border-slate-800/80 p-5 rounded-2xl flex flex-col justify-between">
               <p className="text-xs font-medium text-slate-400 mb-2">Contract Direct Calls</p>
               <div className="grid grid-cols-2 gap-2">
@@ -286,9 +268,7 @@ export default function CollateralGuardDashboard() {
             </div>
           </div>
 
-          {/* ROW 2: HEALTH TIMELINE, ALLOCATION DONUT, & AI SENTIMENT GAUGE */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Chart: Collateral Health Timeline (6 cols) */}
             <div className="lg:col-span-6 bg-[#0f1627] border border-slate-800/80 rounded-2xl p-6">
               <div className="flex items-center justify-between mb-4">
                 <div>
@@ -300,21 +280,17 @@ export default function CollateralGuardDashboard() {
                 </span>
               </div>
 
-              {/* Minimalist SVG Curve (Matching reference design line graph) */}
               <div className="h-44 w-full flex items-end relative pt-4">
                 <svg className="w-full h-full overflow-visible" viewBox="0 0 500 150">
-                  {/* Threshold Guide line at 150% */}
                   <line x1="0" y1="95" x2="500" y2="95" stroke="#ef4444" strokeDasharray="4 4" strokeWidth="1.5" opacity="0.6" />
                   <text x="10" y="90" fill="#ef4444" fontSize="10" fontFamily="monospace">150% Threshold</text>
                   
-                  {/* Performance Area */}
                   <path
                     d="M 0,40 Q 80,20 150,60 T 300,30 T 420,80 T 500,45"
                     fill="none"
                     stroke="#3b82f6"
                     strokeWidth="3"
                   />
-                  {/* Data Points */}
                   {[
                     [0, 40], [80, 20], [150, 60], [220, 45], [300, 30], [360, 55], [420, 80], [500, 45]
                   ].map(([cx, cy], i) => (
@@ -332,17 +308,14 @@ export default function CollateralGuardDashboard() {
               </div>
             </div>
 
-            {/* Asset Allocation Donut (3 cols) */}
             <div className="lg:col-span-3 bg-[#0f1627] border border-slate-800/80 rounded-2xl p-6 flex flex-col justify-between">
               <div>
                 <h4 className="text-sm font-semibold text-white">Asset Allocation</h4>
                 <p className="text-xs text-slate-400">Locked assets in positions</p>
               </div>
 
-              {/* SVG Donut Chart */}
               <div className="relative flex items-center justify-center my-2">
                 <svg className="w-32 h-32 transform -rotate-90" viewBox="0 0 36 36">
-                  {/* Background Circle */}
                   <path
                     className="text-slate-800"
                     strokeWidth="3.8"
@@ -350,7 +323,6 @@ export default function CollateralGuardDashboard() {
                     fill="none"
                     d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
                   />
-                  {/* WETH (65%) */}
                   <path
                     className="text-blue-500"
                     strokeDasharray="65, 100"
@@ -360,7 +332,6 @@ export default function CollateralGuardDashboard() {
                     fill="none"
                     d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
                   />
-                  {/* USDC (35%) */}
                   <path
                     className="text-indigo-400"
                     strokeDasharray="35, 100"
@@ -396,14 +367,247 @@ export default function CollateralGuardDashboard() {
               </div>
             </div>
 
-            {/* Market Sentiment Gauge (Matching reference Arc) (3 cols) */}
             <div className="lg:col-span-3 bg-[#0f1627] border border-slate-800/80 rounded-2xl p-6 flex flex-col justify-between">
               <div>
                 <h4 className="text-sm font-semibold text-white">AI Market Sentiment</h4>
                 <p className="text-xs text-slate-400">gl.nondet.exec_prompt() classification</p>
               </div>
 
-              {/* Semicircle Gauge */}
               <div className="flex flex-col items-center justify-center my-2">
                 <div className="relative w-36 h-20 overflow-hidden flex items-end justify-center">
-                  <div className="w-36 h-36 rounded-full border-[10px] border-slate-800 border-t-amber-500 b
+                  <div className={
+                    "w-36 h-36 rounded-full border-[10px] border-slate-800 " +
+                    "border-t-amber-500 border-r-emerald-500 border-l-red-500 " +
+                    "absolute top-0 transform -rotate-45"
+                  }></div>
+                  <div className="text-center z-10 mb-1">
+                    <span className={`text-base font-bold font-mono ${aiSentiment === "CATASTROPHIC" ? "text-red-400" : "text-emerald-400"}`}>
+                      {aiSentiment}
+                    </span>
+                  </div>
+                </div>
+                <div className="flex justify-between w-full text-[10px] text-slate-400 font-mono px-2 mt-1">
+                  <span className="text-red-400">CATASTROPHIC</span>
+                  <span className="text-emerald-400">NEUTRAL</span>
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-slate-800/60">
+                <button
+                  onClick={() => {
+                    const next = aiSentiment === "NEUTRAL" ? "CATASTROPHIC" : "NEUTRAL";
+                    setAiSentiment(next);
+                    addLog(`Simulated news oracle trigger: Payload marked ${next}.`, next === "CATASTROPHIC" ? "warn" : "info");
+                  }}
+                  className="w-full text-xs py-1.5 px-2 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg text-slate-300 font-mono transition-all"
+                >
+                  Toggle AI Feed: {aiSentiment}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="lg:col-span-8 bg-[#0f1627] border border-slate-800/80 rounded-2xl p-6">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h4 className="text-sm font-semibold text-white">Monitored Positions (TreeMap)</h4>
+                  <p className="text-xs text-slate-400">Deterministic key-sorted accounts on-chain</p>
+                </div>
+                <span className="text-xs text-slate-400 font-mono">{positions.length} active entries</span>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="text-slate-400 border-b border-slate-800 font-mono">
+                    <tr>
+                      <th className="pb-3">Account</th>
+                      <th className="pb-3">Collateral</th>
+                      <th className="pb-3">Debt</th>
+                      <th className="pb-3">Ratio</th>
+                      <th className="pb-3">Risk Status</th>
+                      <th className="pb-3 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 font-mono">
+                    {positions.map((pos, idx) => (
+                      <tr key={idx} className="hover:bg-slate-900/40 transition-colors">
+                        <td className="py-3.5 font-semibold text-slate-200">{pos.address}</td>
+                        <td className="py-3.5 text-slate-300">{pos.collateralAmount} {pos.collateralAsset}</td>
+                        <td className="py-3.5 text-slate-300">${pos.debtAmount.toLocaleString()}</td>
+                        <td className="py-3.5 font-bold">
+                          <span className={pos.status === "CRITICAL" ? "text-red-400" : pos.status === "WARNING" ? "text-amber-400" : "text-emerald-400"}>
+                            {pos.currentRatio}%
+                          </span>
+                        </td>
+                        <td className="py-3.5">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            pos.status === "CRITICAL"
+                              ? "bg-red-500/20 text-red-400 border border-red-500/40"
+                              : pos.status === "WARNING"
+                              ? "bg-amber-500/20 text-amber-400 border border-amber-500/40"
+                              : "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40"
+                          }`}>
+                            {pos.status}
+                          </span>
+                        </td>
+                        <td className="py-3.5 text-right space-x-2">
+                          <button
+                            onClick={() => handleCheckAndProtect(pos.address)}
+                            className="bg-blue-600/20 hover:bg-blue-600 text-blue-400 hover:text-white px-2.5 py-1 rounded-lg text-[11px] font-sans transition-all border border-blue-500/30"
+                          >
+                            Check
+                          </button>
+                          <button
+                            onClick={() => handleRemove(pos.address)}
+                            className="bg-red-500/10 hover:bg-red-600 text-red-400 hover:text-white px-2.5 py-1 rounded-lg text-[11px] font-sans transition-all border border-red-500/20"
+                          >
+                            Remove
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="lg:col-span-4 bg-[#0f1627] border border-slate-800/80 rounded-2xl p-6 flex flex-col justify-between">
+              <div>
+                <h4 className="text-sm font-semibold text-white mb-1">Sentinel Receipt Logs</h4>
+                <p className="text-xs text-slate-400 mb-4">Event emissions & exception receipts</p>
+                <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1 font-mono text-[11px]">
+                  {statusLog.map((log, i) => (
+                    <div
+                      key={i}
+                      className={`p-2.5 rounded-xl border ${
+                        log.type === "danger"
+                          ? "bg-red-950/20 border-red-800/40 text-red-300"
+                          : log.type === "warn"
+                          ? "bg-amber-950/20 border-amber-800/40 text-amber-300"
+                          : log.type === "success"
+                          ? "bg-emerald-950/20 border-emerald-800/40 text-emerald-300"
+                          : "bg-slate-900 border-slate-800 text-slate-300"
+                      }`}
+                    >
+                      <div className="flex justify-between text-[9px] text-slate-400 mb-1">
+                        <span>Receipt</span>
+                        <span>{log.time}</span>
+                      </div>
+                      <p className="break-all">{log.msg}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="pt-4 border-t border-slate-800/60 mt-4">
+                <span className="text-[10px] text-slate-500 font-mono">
+                  State Merkle Root: Deterministic TreeMap Sync
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      {showAddModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-[#0f1627] border border-slate-800 rounded-2xl p-6 w-full max-w-md space-y-4">
+            <h3 className="text-base font-bold text-white">add_monitored_account</h3>
+            <p className="text-xs text-slate-400">Registers a position into the Merkleized TreeMap state.</p>
+            <form onSubmit={handleAddAccount} className="space-y-3">
+              <div>
+                <label className="text-[11px] font-mono text-slate-400">Account Address (0x...)</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="0x4edD19dcEa0A493E6fa5Fe2DDCF83b0778f0873a"
+                  value={modalAddress}
+                  onChange={(e) => setModalAddress(e.target.value)}
+                  className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-white outline-none focus:border-blue-500"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-[11px] font-mono text-slate-400">Collateral (WETH)</label>
+                  <input
+                    type="number"
+                    step="any"
+                    required
+                    placeholder="10"
+                    value={modalCollateral}
+                    onChange={(e) => setModalCollateral(e.target.value)}
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-white outline-none focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-[11px] font-mono text-slate-400">Debt (USDC)</label>
+                  <input
+                    type="number"
+                    step="any"
+                    required
+                    placeholder="5000"
+                    value={modalDebt}
+                    onChange={(e) => setModalDebt(e.target.value)}
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-white outline-none focus:border-blue-500"
+                  />
+                </div>
+              </div>
+              <div className="flex justify-end space-x-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAddModal(false)}
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-semibold rounded-xl text-slate-300"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-xs font-semibold rounded-xl text-white"
+                >
+                  Commit Account
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showCheckModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-[#0f1627] border border-slate-800 rounded-2xl p-6 w-full max-w-md space-y-4">
+            <h3 className="text-base font-bold text-white">Execute check_and_protect</h3>
+            <p className="text-xs text-slate-400">Simulate a keeper triggering the dual-consensus check.</p>
+            <div className="space-y-2">
+              <label className="text-[11px] font-mono text-slate-400">Select Target Position</label>
+              {positions.map((pos, idx) => (
+                <button
+                  key={idx}
+                  onClick={() => {
+                    handleCheckAndProtect(pos.address);
+                    setShowCheckModal(false);
+                  }}
+                  className="w-full p-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 flex justify-between items-center text-xs font-mono transition-colors"
+                >
+                  <span className="text-slate-200">{pos.address}</span>
+                  <span className={pos.status === "CRITICAL" ? "text-red-400" : pos.status === "WARNING" ? "text-amber-400" : "text-emerald-400"}>
+                    {pos.currentRatio}%
+                  </span>
+                </button>
+              ))}
+            </div>
+            <div className="flex justify-end pt-2">
+              <button
+                type="button"
+                onClick={() => setShowCheckModal(false)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-semibold rounded-xl text-slate-300"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
