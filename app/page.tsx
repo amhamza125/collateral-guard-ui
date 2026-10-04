@@ -825,7 +825,7 @@ export default function Page() {
       for (let i = 0; i < attempts; i++) {
         await sleep(delayMs);
         try {
-         const t: any = await getReadClient().getTransaction({ hash: hash as `0x${string}` });
+         const t: any = await getReadClient().getTransaction({ hash: hash as any });
           if (!t) continue;
           const statusNum = Number(t.status);
           const chainStatus = STATUS_NAMES[statusNum] ?? String(t.statusName ?? statusNum);
