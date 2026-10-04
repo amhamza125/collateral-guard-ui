@@ -1,434 +1,951 @@
-"use client";
+'use client';
 
-import React, { useState, useEffect, useRef, useMemo } from "react";
-import { ethers } from "ethers";
+/**
+ * CollateralGuard — DeFi Risk Engine ("Cryzen" design language)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SETUP
+ *   1. npm install genlayer-js   (the official SDK — no ethers, no hand-rolled
+ *      calldata encoding; the SDK handles GenVM calldata/RLP + receipts natively)
+ *   2. Contract is preconfigured to the deployed CollateralGuard on Studionet
+ *      (chain ID 61999). To point at a different deployment, set
+ *      NEXT_PUBLIC_GUARD_ADDRESS in .env.local and restart the dev server.
+ *   3. Deploy to Vercel as usual — all chain calls run client-side.
+ *
+ * WHY THE SDK (hard-won): calling GenLayer through raw ethers v6 crashes on
+ * tx.wait() (GenVM receipts are not EVM receipts → BAD_DATA), and GenVM
+ * calldata is not Solidity ABI. genlayer-js handles both, exposes
+ * waitForTransactionReceipt with real GenLayer tx statuses, and its
+ * readContract/writeContract take plain functionName + args.
+ */
 
-const CONTRACT_ADDRESS = "0xC4Be515B4fab18f2D87D8BE0BF28d1f1Ef15cc4B";
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createClient } from 'genlayer-js';
+import { studionet } from 'genlayer-js/chains';
+import { ExecutionResult, TransactionStatus } from 'genlayer-js/types';
 
-const CONTRACT_ABI = [
-  "function add_monitored_account(string account_address, uint256 collateral_amount, uint256 debt_amount, string collateral_asset, string debt_asset)",
-  "function check_and_protect(string account_address)"
-];
-
-interface Position {
-  address: string;
-  collateralAmount: number;
-  debtAmount: number;
-  collateralAsset: string;
-  debtAsset: string;
-  thresholdPercent: number;
-  currentRatio: number;
-  status: "SAFE" | "WARNING" | "CRITICAL";
+declare global {
+  interface Window {
+    ethereum?: any;
+  }
 }
 
-export default function CollateralGuardDashboard() {
-  const [walletAddress, setWalletAddress] = useState<string | null>(null);
-  const [protocolPaused, setProtocolPaused] = useState<boolean>(false);
-  const [globalThreshold] = useState<number>(150);
-  const [aiSentiment, setAiSentiment] = useState<"NEUTRAL" | "CATASTROPHIC">("NEUTRAL");
-  
-  const [oraclePrices, setOraclePrices] = useState<Record<string, number>>({
-    WETH: 3200, WBTC: 64500, SOL: 145, USDC: 1, USDT: 1
-  });
+/* ─────────────────────────────── CONFIG ─────────────────────────────── */
 
-  const [positions, setPositions] = useState<Position[]>([]);
-  
-  const [statusLog, setStatusLog] = useState<{ msg: string; type: "info" | "warn" | "danger" | "success"; time: string; hash?: string }[]>([
-    { msg: "GenLayer UI Initialized. Awaiting Wallet...", type: "info", time: new Date().toLocaleTimeString() },
-  ]);
-  const logsEndRef = useRef<HTMLDivElement>(null);
+// Deployed CollateralGuard on GenLayer Studionet (chain ID 61999).
+const CONTRACT_ADDRESS = (
+  process.env.NEXT_PUBLIC_GUARD_ADDRESS ?? '0xaCBd7A2861E5f41276F17ffCF0881906798988C4'
+).toLowerCase() as `0x${string}`;
 
-  const [showAddModal, setShowAddModal] = useState<boolean>(false);
-  const [modalCollateral, setModalCollateral] = useState<string>("");
-  const [modalDebt, setModalDebt] = useState<string>("");
-  const [modalCollAsset, setModalCollAsset] = useState<string>("WETH");
-  const [isTxPending, setIsTxPending] = useState<boolean>(false);
+const NETWORK_LABEL = 'GenLayer Studionet';
+const EXPLORER_TX = 'https://explorer-studio.genlayer.com/tx/';
+const THRESHOLD = 150;
 
-  useEffect(() => {
-    const fetchLivePrices = async () => {
-      try {
-        const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin,solana&vs_currencies=usd");
-        const data = await res.json();
-        setOraclePrices({
-          WETH: data.ethereum.usd,
-          WBTC: data.bitcoin.usd,
-          SOL: data.solana.usd,
-          USDC: 1,
-          USDT: 1
-        });
-      } catch (err) {
-        console.error("Price fetch failed.");
-      }
+// Display-only spot prices for the dashboard charts. The contract itself
+// fetches the live price from Binance inside the consensus flow during check().
+const DISPLAY_PRICES: Record<string, number> = { ETH: 3200, BTC: 64000, SOL: 150 };
+const ASSET_COLORS: Record<string, string> = { ETH: '#627eea', BTC: '#f7931a', SOL: '#14f195' };
+
+type GenClient = ReturnType<typeof createClient>;
+
+// Read client talks straight to the GenLayer RPC — no wallet needed.
+let readClientSingleton: GenClient | null = null;
+function getReadClient(): GenClient {
+  if (!readClientSingleton) readClientSingleton = createClient({ chain: studionet });
+  return readClientSingleton;
+}
+
+/* ───────────────────────────── types/misc ───────────────────────────── */
+
+type Position = {
+  address: string;
+  collateral_amount: number;
+  debt_amount: number;
+  collateral_asset: string;
+  debt_asset: string;
+  status: 'SAFE' | 'WARNING' | 'CRITICAL';
+  last_ratio: number;
+  ai_sentiment?: string;
+  price_source?: string;
+  last_message: string;
+  last_checked: string;
+  localOnly?: boolean;
+};
+
+type LogLevel = 'info' | 'success' | 'warn' | 'error' | 'ai';
+
+type LogEntry = {
+  id: number;
+  time: string;
+  level: LogLevel;
+  msg: string;
+  txHash?: string;
+};
+
+const short = (a: string) => (a.length > 13 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a);
+const fmtUSD = (n: number) => `$${Math.round(n).toLocaleString('en-US')}`;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const SEED_POSITIONS: Position[] = [
+  {
+    address: '0x9ab41c7d5f3a92e0b6d18c4a77e2f9d0c5b8a3e1',
+    collateral_amount: 40, debt_amount: 60000, collateral_asset: 'ETH', debt_asset: 'USDT',
+    status: 'SAFE', last_ratio: 213, ai_sentiment: 'NEUTRAL', price_source: 'LIVE',
+    last_message: 'RATIO_SAFE_CONDITION_HELD: ratio 213% is healthy — AI sentiment is NEUTRAL',
+    last_checked: 'CHECK #12', localOnly: true,
+  },
+  {
+    address: '0x1c7d9f02e5a4b8306d91c7f5a2e8b4d0f3a6c9e2',
+    collateral_amount: 10, debt_amount: 400000, collateral_asset: 'BTC', debt_asset: 'USDT',
+    status: 'WARNING', last_ratio: 160, ai_sentiment: 'CATASTROPHIC', price_source: 'LIVE',
+    last_message: 'AI_CONSENSUS_WARNING: ratio 160% held, but AI consensus detected catastrophic market sentiment',
+    last_checked: 'CHECK #13', localOnly: true,
+  },
+  {
+    address: '0xf3a902b7c4d1e6f8a5b3c2d9e7f4a1b6c8d0e3f5',
+    collateral_amount: 300, debt_amount: 70000, collateral_asset: 'SOL', debt_asset: 'USDT',
+    status: 'CRITICAL', last_ratio: 64, ai_sentiment: 'NEUTRAL', price_source: 'FALLBACK',
+    last_message: 'CRITICAL_BREACH: ratio 64% < 150% — CIRCUIT_BREAKER_ENGAGED, protocol paused',
+    last_checked: 'CHECK #14', localOnly: true,
+  },
+];
+
+const STATUS_STYLES: Record<Position['status'], string> = {
+  SAFE: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
+  WARNING: 'bg-amber-500/10 text-amber-300 border-amber-500/30',
+  CRITICAL: 'bg-rose-500/10 text-rose-400 border-rose-500/30 animate-pulse',
+};
+
+/* ─────────────────────────── SVG components ─────────────────────────── */
+
+function Donut({
+  segments, size = 170, thickness = 22, centerLabel, centerSub,
+}: {
+  segments: { label: string; value: number; color: string }[];
+  size?: number;
+  thickness?: number;
+  centerLabel: string;
+  centerSub: string;
+}) {
+  const total = segments.reduce((s, x) => s + x.value, 0) || 1;
+  const r = (size - thickness) / 2;
+  const c = 2 * Math.PI * r;
+  let acc = 0;
+  return (
+    <div className="relative" style={{ width: size, height: size }}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="-rotate-90">
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#141d33" strokeWidth={thickness} />
+        {segments.map((s) => {
+          const dash = Math.max((s.value / total) * c - 2, 0);
+          const el = (
+            <circle
+              key={s.label}
+              cx={size / 2} cy={size / 2} r={r}
+              fill="none" stroke={s.color} strokeWidth={thickness}
+              strokeDasharray={`${dash} ${c - dash}`}
+              strokeDashoffset={-acc}
+            />
+          );
+          acc += (s.value / total) * c;
+          return el;
+        })}
+      </svg>
+      <div className="absolute inset-0 flex flex-col items-center justify-center">
+        <span className="text-lg font-semibold text-slate-100">{centerLabel}</span>
+        <span className="text-[10px] uppercase tracking-widest text-slate-500">{centerSub}</span>
+      </div>
+    </div>
+  );
+}
+
+function HealthTimeline({ positions, threshold }: { positions: Position[]; threshold: number }) {
+  const series = useMemo(() => {
+    const coll = positions.reduce((s, p) => s + p.collateral_amount * (DISPLAY_PRICES[p.collateral_asset] ?? 1000), 0);
+    const debt = Math.max(1, positions.reduce((s, p) => s + p.debt_amount, 0));
+    const current = Math.min(340, Math.max(90, Math.round((coll * 100) / debt)));
+    // deterministic pseudo-random walk — same picture on every render
+    let seed = 42 + positions.length * 7 + current * 13;
+    const rand = () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed / 2147483648;
     };
-    fetchLivePrices();
+    const pts: number[] = [];
+    let v = current * 0.86;
+    for (let i = 0; i < 29; i++) {
+      v = Math.max(95, Math.min(330, v + (rand() - 0.48) * 18));
+      pts.push(v);
+    }
+    pts.push(current);
+    return { pts, current };
+  }, [positions]);
+
+  const W = 640;
+  const H = 220;
+  const y = (v: number) => 200 - ((v - 80) / 260) * 184;
+  const x = (i: number, n: number) => 40 + (i * (W - 80)) / (n - 1);
+  const line = series.pts.map((p, i) => `${x(i, series.pts.length)},${y(p)}`).join(' ');
+  const area = `M ${x(0, series.pts.length)},${y(series.pts[0])} `
+    + series.pts.slice(1).map((p, i) => `L ${x(i + 1, series.pts.length)},${y(p)}`).join(' ')
+    + ` L ${x(series.pts.length - 1, series.pts.length)},200 L ${x(0, series.pts.length)},200 Z`;
+  const lastX = x(series.pts.length - 1, series.pts.length);
+  const lastY = y(series.pts[series.pts.length - 1]);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="h-full w-full">
+      <defs>
+        <linearGradient id="healthFill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#22d3ee" stopOpacity="0.25" />
+          <stop offset="100%" stopColor="#22d3ee" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {[100, 200, 300].map((g) => (
+        <g key={g}>
+          <line x1={40} x2={W - 20} y1={y(g)} y2={y(g)} stroke="#141d33" strokeWidth="1" />
+          <text x={W - 22} y={y(g) + 3} textAnchor="end" fontSize="9" fill="#334155">{g}%</text>
+        </g>
+      ))}
+      <line x1={40} x2={W - 20} y1={y(threshold)} y2={y(threshold)} stroke="#fb7185" strokeWidth="1" strokeDasharray="5 4" opacity="0.7" />
+      <text x={44} y={y(threshold) - 5} fontSize="9" fill="#fb7185">LIQ THRESHOLD {threshold}%</text>
+      <path d={area} fill="url(#healthFill)" />
+      <polyline points={line} fill="none" stroke="#22d3ee" strokeWidth="2" strokeLinejoin="round" />
+      <circle cx={lastX} cy={lastY} r="4" fill="#22d3ee" />
+      <circle cx={lastX} cy={lastY} r="8" fill="#22d3ee" opacity="0.25" />
+      <text x={lastX - 8} y={lastY - 12} textAnchor="end" fontSize="12" fontWeight="600" fill="#e2e8f0">
+        {series.current}%
+      </text>
+      <text x={40} y={216} fontSize="9" fill="#334155">27h ago</text>
+      <text x={W / 2} y={216} fontSize="9" fill="#334155" textAnchor="middle">14h ago</text>
+      <text x={W - 20} y={216} fontSize="9" fill="#334155" textAnchor="end">now</text>
+    </svg>
+  );
+}
+
+/* ─────────────────────────── UI sub-components ──────────────────────── */
+
+function StatusBadge({ status }: { status: Position['status'] }) {
+  return (
+    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${STATUS_STYLES[status]}`}>
+      <span className="h-1.5 w-1.5 rounded-full bg-current" />
+      {status}
+    </span>
+  );
+}
+
+function Sidebar({ wallet }: { wallet: string | null }) {
+  const nav = [
+    { label: 'Dashboard', active: true, d: 'M3 12l9-8 9 8M5 10v10h14V10' },
+    { label: 'Accounts', active: false, d: 'M4 6h16M4 12h16M4 18h10' },
+    { label: 'Risk Engine', active: false, d: 'M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z' },
+    { label: 'History', active: false, d: 'M12 8v5l3 3M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
+    { label: 'Settings', active: false, d: 'M12 15a3 3 0 100-6 3 3 0 000 6zM19 12a7 7 0 01-.1 1.2l2 1.6-2 3.4-2.4-1a7 7 0 01-2 1.2L14 21h-4l-.5-2.6a7 7 0 01-2-1.2l-2.4 1-2-3.4 2-1.6A7 7 0 015 12' },
+  ];
+  return (
+    <aside className="hidden w-64 shrink-0 flex-col border-r border-[#131c30] bg-[#090e1a] md:flex">
+      <div className="flex items-center gap-3 px-6 py-6">
+        <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-400 to-blue-600">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#070b14" strokeWidth="2.2">
+            <path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" />
+          </svg>
+        </div>
+        <div>
+          <div className="text-sm font-semibold text-slate-100">CollateralGuard</div>
+          <div className="text-[10px] uppercase tracking-[0.2em] text-cyan-500/80">by Cryzen</div>
+        </div>
+      </div>
+
+      <nav className="mt-2 flex-1 space-y-1 px-3">
+        {nav.map((n) => (
+          <div
+            key={n.label}
+            className={`flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm ${
+              n.active
+                ? 'border border-[#1b2b47] bg-[#0d1526] text-cyan-300'
+                : 'text-slate-500 hover:bg-[#0d1526] hover:text-slate-300'
+            }`}
+          >
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d={n.d} />
+            </svg>
+            {n.label}
+          </div>
+        ))}
+      </nav>
+
+      <div className="m-4 rounded-xl border border-[#131c30] bg-[#0b1120] p-4">
+        <div className="flex items-center gap-2 text-xs text-slate-300">
+          <span className="relative flex h-2 w-2">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
+          </span>
+          {NETWORK_LABEL}
+        </div>
+        <div className="mt-1 text-[10px] text-slate-600">chain 61999 · Intelligent Consensus · LLM validators</div>
+        <div className="mt-3 border-t border-[#131c30] pt-3 text-[10px] text-slate-600">
+          {wallet ? (
+            <>Operator <span className="font-mono text-slate-400">{short(wallet)}</span></>
+          ) : (
+            <>Operator <span className="text-amber-500/80">not connected</span></>
+          )}
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function Terminal({ logs, termRef }: { logs: LogEntry[]; termRef: React.RefObject<HTMLDivElement | null> }) {
+  const color: Record<LogLevel, string> = {
+    info: 'text-slate-300',
+    success: 'text-emerald-400',
+    warn: 'text-amber-300',
+    error: 'text-rose-400',
+    ai: 'text-cyan-300',
+  };
+  return (
+    <div className="flex h-full min-h-[420px] flex-col overflow-hidden rounded-2xl border border-[#131c30] bg-[#090e1a]">
+      <div className="flex items-center gap-2 border-b border-[#131c30] px-4 py-3">
+        <span className="h-2 w-2 rounded-full bg-emerald-400" />
+        <span className="text-[11px] font-medium uppercase tracking-widest text-slate-400">
+          Terminal — genvm://collateralguard
+        </span>
+      </div>
+      <div ref={termRef} className="flex-1 space-y-1.5 overflow-y-auto px-4 py-3 font-mono text-[11px] leading-relaxed">
+        {logs.map((l) => (
+          <div key={l.id} className="flex flex-wrap gap-x-2">
+            <span className="text-slate-600">[{l.time}]</span>
+            <span className="text-slate-700">▸</span>
+            <span className={color[l.level]}>{l.msg}</span>
+            {l.txHash && (
+              <a
+                href={`${EXPLORER_TX}${l.txHash}`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-cyan-400 underline decoration-dotted underline-offset-2 hover:text-cyan-300"
+              >
+                {short(l.txHash)} ↗
+              </a>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AddFundsModal({
+  onClose, onSubmit, pending, defaultAccount,
+}: {
+  onClose: () => void;
+  onSubmit: (form: { account: string; collateral: string; debt: string; asset: string }) => void;
+  pending: boolean;
+  defaultAccount: string;
+}) {
+  const [form, setForm] = useState({ account: defaultAccount, collateral: '25', debt: '55000', asset: 'ETH' });
+  const set = (k: string, v: string) => setForm((f) => ({ ...f, [k]: v }));
+  const field = 'w-full rounded-lg border border-[#1e293b] bg-[#070b14] px-3 py-2 text-sm text-slate-200 outline-none focus:border-cyan-400/60';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-full max-w-md rounded-2xl border border-[#1b2b47] bg-[#0b1120] p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="mb-1 text-lg font-semibold text-slate-100">Add Account / Funds</div>
+        <p className="mb-5 text-xs text-slate-500">
+          Broadcasts a real transaction to CollateralGuard on {NETWORK_LABEL} (61999). You will sign in MetaMask.
+        </p>
+
+        <label className="mb-1.5 block text-xs font-medium text-slate-400">Account address</label>
+        <input className={`${field} mb-4 font-mono`} value={form.account} onChange={(e) => set('account', e.target.value)} placeholder="0x…" />
+
+        <div className="mb-4 grid grid-cols-2 gap-3">
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-slate-400">Collateral asset</label>
+            <select className={field} value={form.asset} onChange={(e) => set('asset', e.target.value)}>
+              <option>ETH</option>
+              <option>BTC</option>
+              <option>SOL</option>
+            </select>
+          </div>
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-slate-400">Collateral amount</label>
+            <input className={field} type="number" min="1" value={form.collateral} onChange={(e) => set('collateral', e.target.value)} />
+          </div>
+        </div>
+
+        <label className="mb-1.5 block text-xs font-medium text-slate-400">Debt (USDT)</label>
+        <input className={`${field} mb-6`} type="number" min="1" value={form.debt} onChange={(e) => set('debt', e.target.value)} />
+
+        <div className="flex gap-3">
+          <button className="flex-1 rounded-lg border border-[#1e293b] px-4 py-2.5 text-sm text-slate-400 hover:text-slate-200" onClick={onClose} disabled={pending}>
+            Cancel
+          </button>
+          <button
+            className="flex-1 rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 px-4 py-2.5 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50"
+            onClick={() => onSubmit(form)}
+            disabled={pending}
+          >
+            {pending ? 'Waiting for signature…' : 'Sign & Broadcast'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────── PAGE ───────────────────────────────── */
+
+export default function Page() {
+  const [wallet, setWallet] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [positions, setPositions] = useState<Position[]>(SEED_POSITIONS);
+  const [logs, setLogs] = useState<LogEntry[]>([
+    {
+      id: 0,
+      time: new Date().toLocaleTimeString('en-GB'),
+      level: 'info',
+      msg: 'CollateralGuard risk engine online — GenLayer Intelligent Consensus ready',
+    },
+  ]);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [checkingAddr, setCheckingAddr] = useState<string | null>(null);
+  const [resuming, setResuming] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [txByAccount, setTxByAccount] = useState<Record<string, string>>({});
+
+  const writeClientRef = useRef<GenClient | null>(null);
+  const logIdRef = useRef(1);
+  const termRef = useRef<HTMLDivElement | null>(null);
+
+  const pushLog = useCallback((level: LogLevel, msg: string, txHash?: string) => {
+    setLogs((prev) => [
+      ...prev.slice(-200),
+      { id: logIdRef.current++, time: new Date().toLocaleTimeString('en-GB'), level, msg, txHash },
+    ]);
   }, []);
 
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [statusLog]);
+    const el = termRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [logs]);
 
-  const addLog = (msg: string, type: "info" | "warn" | "danger" | "success" = "info", hash?: string) => {
-    const timeStr = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    setStatusLog((prev) => [...prev, { msg, type, time: timeStr, hash }]);
-  };
+  /* ── GenVM reads/writes through the official SDK ── */
 
-  const connectWallet = async () => {
-    if (typeof window !== "undefined" && (window as any).ethereum) {
+  const callView = useCallback(
+    async (method: string, args: unknown[] = []): Promise<unknown> => {
+      // SDK handles GenVM calldata encoding + decoding; a str return arrives as a JS string.
+      return await getReadClient().readContract({
+        address: CONTRACT_ADDRESS,
+        functionName: method,
+        args: args as any,
+      });
+    },
+    [],
+  );
+
+  const sendWrite = useCallback(
+    async (method: string, args: unknown[]): Promise<string> => {
+      const client = writeClientRef.current;
+      if (!client) throw new Error('wallet not connected');
+      const txHash = await client.writeContract({
+        address: CONTRACT_ADDRESS,
+        functionName: method,
+        args: args as any,
+        value: BigInt(0),
+      });
+      pushLog('info', `Tx broadcast: ${short(txHash)} — waiting for GenVM consensus…`, txHash);
+
+      // ACCEPTED = validators agreed on the execution; FINALIZED comes later.
+      let receipt: any = null;
       try {
-        const provider = new ethers.BrowserProvider((window as any).ethereum);
-        await provider.send("eth_requestAccounts", []);
-        const signer = await provider.getSigner();
-        const address = await signer.getAddress();
-        setWalletAddress(address);
-        addLog(`Wallet Connected: ${address}`, "success");
-        addLog(`Syncing State from GenLayer TreeMap...`, "info");
-        setTimeout(() => {
-            if (positions.length === 0) {
-               addLog(`No active positions found in state. Ready for deposits.`, "warn");
-            }
-        }, 1000);
-      } catch (err) {
-        addLog("Wallet connection rejected.", "danger");
+        receipt = await getReadClient().waitForTransactionReceipt({
+          hash: txHash,
+          status: TransactionStatus.ACCEPTED,
+        });
+      } catch {
+        pushLog('warn', 'Consensus still settling — continuing to watch contract state');
       }
-    } else {
-      alert("Please install MetaMask or Rabby.");
-    }
-  };
-
-  const handleAddAccount = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!walletAddress) return alert("Connect wallet first!");
-    
-    try {
-      setIsTxPending(true);
-      const provider = new ethers.BrowserProvider((window as any).ethereum);
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
-      
-      const collScaled = ethers.parseUnits(modalCollateral, 18);
-      const debtScaled = ethers.parseUnits(modalDebt, 18);
-
-      addLog(`Executing add_monitored_account()...`, "info");
-      
-      // REAL TRANSACTION
-      const tx = await contract.add_monitored_account(
-        walletAddress, collScaled, debtScaled, modalCollAsset, "USDC",
-        { gasLimit: 5000000 }
-      );
-      
-      addLog(`TX Broadcasted! Hash generated.`, "warn", tx.hash);
-      
-      // We wrap the wait in a try/catch to bypass Ethers crashing on GenLayer's custom receipt
-      try { await tx.wait(1); } catch (e) {} 
-      
-      addLog(`Success! Position recorded on GenLayer Testnet.`, "success");
-      
-      const coll = parseFloat(modalCollateral);
-      const dbt = parseFloat(modalDebt);
-      const collValue = coll * (oraclePrices[modalCollAsset] || 3200);
-      const ratio = dbt === 0 ? 0 : (collValue / dbt) * 100;
-      const status = ratio < globalThreshold ? "CRITICAL" : ratio < globalThreshold + 15 ? "WARNING" : "SAFE";
-
-      // Updates UI Table Smoothly
-      setPositions([{
-        address: walletAddress,
-        collateralAmount: coll,
-        debtAmount: dbt,
-        collateralAsset: modalCollAsset,
-        debtAsset: "USDC",
-        thresholdPercent: globalThreshold,
-        currentRatio: parseFloat(ratio.toFixed(1)),
-        status
-      }]);
-      
-      setShowAddModal(false);
-      setModalCollateral("");
-      setModalDebt("");
-    } catch (error: any) {
-      if (error.code === 'ACTION_REJECTED') {
-         addLog(`Transaction rejected by user.`, "danger");
-      } else {
-         addLog(`RPC Error: Check connection.`, "danger");
+      if (receipt && receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
+        pushLog('error', `Contract execution failed on-chain (state was reverted)`, txHash);
+        throw new Error('execution reverted');
       }
-    } finally {
-      setIsTxPending(false);
-    }
-  };
+      if (receipt && receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_RETURN) {
+        pushLog('success', 'Consensus ACCEPTED — validators finalized the execution', txHash);
+      }
+      return txHash;
+    },
+    [pushLog],
+  );
 
-  const handleCheckAndProtect = async (targetAddr: string) => {
-    if (!walletAddress) return alert("Connect wallet first!");
-    const target = positions.find((p) => p.address === targetAddr);
-    if (!target) return;
-
-    try {
-      const provider = new ethers.BrowserProvider((window as any).ethereum);
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
-      
-      addLog(`Executing check_and_protect() on-chain...`, "info");
-      
-      // REAL TRANSACTION
-      const tx = await contract.check_and_protect(targetAddr, { gasLimit: 8000000 });
-      addLog(`TX Broadcasted! Awaiting GenVM AI Consensus...`, "warn", tx.hash);
-      
-      try { await tx.wait(1); } catch (e) {}
-      
-      // Fetch result and output precise Python contract logs
-      setTimeout(() => {
-        if (target.status === "CRITICAL") {
-          setProtocolPaused(true);
-          addLog(`[ON-CHAIN RESULT]: CRITICAL BREACH. Ratio < Threshold. Protocol Paused!`, "danger");
-        } else if (target.status === "WARNING" || aiSentiment === "CATASTROPHIC") {
-          addLog(`[AI CONSENSUS]: RATIO_WARNING_CONDITION. Nearing threshold or bad news detected.`, "warn");
-        } else {
-          addLog(`[AI CONSENSUS]: RATIO_SAFE_CONDITION_HELD. Position mathematically sound.`, "success");
+  const pollPosition = useCallback(
+    async (addr: string, attempts = 12, delayMs = 4000): Promise<Position | null> => {
+      for (let i = 0; i < attempts; i++) {
+        await sleep(delayMs);
+        try {
+          const raw = await callView('get_position_status', [addr]);
+          if (typeof raw === 'string' && raw !== 'NOT_FOUND') {
+            const rec = JSON.parse(raw);
+            return { ...rec, address: addr } as Position;
+          }
+        } catch {
+          /* consensus still settling */
         }
-      }, 1500);
+        if (i % 3 === 2) pushLog('ai', `Validators deliberating… (${i + 1}/${attempts})`);
+      }
+      return null;
+    },
+    [callView, pushLog],
+  );
 
-    } catch (error: any) {
-      addLog(`Transaction Rejected.`, "danger");
+  const syncFromChain = useCallback(async () => {
+    try {
+      const raw = await callView('get_all_accounts', []);
+      const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (Array.isArray(list) && list.length > 0) {
+        setPositions(list.map((r: any) => ({ ...r, address: r.address, localOnly: false }) as Position));
+        pushLog('success', `Synced ${list.length} monitored account(s) from GenVM state`);
+      }
+      const ps = await callView('get_protocol_state', []);
+      const st = typeof ps === 'string' ? JSON.parse(ps) : ps;
+      if (st && typeof st === 'object') setPaused(Boolean((st as any).paused));
+    } catch {
+      /* silent — the demo continues on local state */
     }
-  };
+  }, [callView, pushLog]);
 
-  const totalMonitoredValue = useMemo(() => {
-    return positions.reduce((sum, pos) => sum + (pos.collateralAmount * (oraclePrices[pos.collateralAsset] || 0)), 0);
-  }, [positions, oraclePrices]);
+  /* ── wallet ── */
+
+  const connectWallet = useCallback(async (): Promise<string | null> => {
+    const eth = window.ethereum;
+    if (!eth) {
+      pushLog('error', 'MetaMask not detected — install it to interact with GenLayer');
+      return null;
+    }
+    try {
+      setConnecting(true);
+      const accounts: string[] = await eth.request({ method: 'eth_requestAccounts' });
+      const addr = accounts?.[0] ?? null;
+      if (addr) {
+        // Write client signs through MetaMask; connect() switches the wallet to
+        // Studionet (chain 61999) and adds the network if it is not present.
+        const client = createClient({
+          chain: studionet,
+          account: addr as `0x${string}`,
+          provider: eth,
+        });
+        await client.connect('studionet');
+        writeClientRef.current = client;
+        setWallet(addr);
+        pushLog('success', `Wallet connected: ${short(addr)} — ${NETWORK_LABEL} (61999)`);
+        void syncFromChain();
+      }
+      return addr;
+    } catch (e: any) {
+      pushLog('error', `Wallet connection failed: ${e?.shortMessage ?? e?.message ?? e}`);
+      return null;
+    } finally {
+      setConnecting(false);
+    }
+  }, [pushLog, syncFromChain]);
+
+  useEffect(() => {
+    const eth = window.ethereum;
+    if (!eth) return;
+    eth
+      .request({ method: 'eth_accounts' })
+      .then((accs: string[]) => {
+        if (accs?.length) void connectWallet();
+      })
+      .catch(() => {});
+    const onAccounts = (accs: string[]) => {
+      if (!accs?.length) {
+        setWallet(null);
+        writeClientRef.current = null;
+        pushLog('warn', 'Wallet disconnected');
+      } else {
+        setWallet(accs[0]);
+      }
+    };
+    eth.on?.('accountsChanged', onAccounts);
+    return () => eth.removeListener?.('accountsChanged', onAccounts);
+  }, [connectWallet, pushLog]);
+
+  /* ── actions ── */
+
+  const upsert = useCallback((p: Position) => {
+    setPositions((prev) => {
+      const i = prev.findIndex((x) => x.address.toLowerCase() === p.address.toLowerCase());
+      if (i === -1) return [...prev, p];
+      const next = [...prev];
+      next[i] = { ...prev[i], ...p };
+      return next;
+    });
+  }, []);
+
+  const runCheck = useCallback(
+    async (pos: Position) => {
+      if (!wallet) {
+        const w = await connectWallet();
+        if (!w || !writeClientRef.current) return;
+      }
+      setCheckingAddr(pos.address);
+      pushLog('ai', `check_and_protect(${short(pos.address)}) → validators fetching ${pos.collateral_asset} price via Binance, then LLM consensus…`);
+      try {
+        const hash = await sendWrite('check_and_protect', [pos.address]);
+        pushLog('ai', 'Equivalence principle active — every validator must agree on the risk verdict…');
+        const fresh = await pollPosition(pos.address);
+        if (fresh) {
+          upsert(fresh);
+          setTxByAccount((prev) => ({ ...prev, [pos.address]: hash }));
+          const level: LogLevel = fresh.status === 'CRITICAL' ? 'error' : fresh.status === 'WARNING' ? 'warn' : 'success';
+          pushLog(level, fresh.last_message, hash);
+          if (fresh.status === 'CRITICAL') {
+            setPaused(true);
+            pushLog('error', 'CIRCUIT BREAKER ENGAGED — every further check() will revert until the owner resumes the protocol');
+          }
+        } else {
+          pushLog('warn', 'Consensus still in flight — press Refresh in a moment to pick up the verdict');
+        }
+      } catch (e: any) {
+        pushLog('error', `check_and_protect failed: ${e?.shortMessage ?? e?.message ?? e}`);
+      } finally {
+        setCheckingAddr(null);
+      }
+    },
+    [wallet, connectWallet, pushLog, sendWrite, pollPosition, upsert],
+  );
+
+  const submitAddFunds = useCallback(
+    async (form: { account: string; collateral: string; debt: string; asset: string }) => {
+      const account = form.account.trim();
+      const collateral = Math.round(Number(form.collateral));
+      const debt = Math.round(Number(form.debt));
+      if (!/^0x[0-9a-fA-F]{6,}$/.test(account)) {
+        pushLog('error', 'INVALID_ADDRESS — account must be a hex address (0x…)');
+        return;
+      }
+      if (!Number.isFinite(collateral) || collateral <= 0 || !Number.isFinite(debt) || debt <= 0) {
+        pushLog('error', 'INVALID_AMOUNT — collateral and debt must be positive numbers');
+        return;
+      }
+      setAdding(true);
+      try {
+        if (!wallet) {
+          const w = await connectWallet();
+          if (!w || !writeClientRef.current) return;
+        }
+        pushLog('info', `add_monitored_account(${short(account)}, ${collateral} ${form.asset}, ${debt} USDT) — confirm in MetaMask…`);
+        const hash = await sendWrite('add_monitored_account', [account, collateral, debt, form.asset, 'USDT']);
+        // Optimistic local update so the funds appear in the table immediately,
+        // then confirm against real GenVM state in the background.
+        upsert({
+          address: account,
+          collateral_amount: collateral,
+          debt_amount: debt,
+          collateral_asset: form.asset,
+          debt_asset: 'USDT',
+          status: 'SAFE',
+          last_ratio: 0,
+          ai_sentiment: 'N/A',
+          last_message: 'Broadcast — awaiting first AI consensus check',
+          last_checked: 'PENDING',
+        });
+        setTxByAccount((prev) => ({ ...prev, [account]: hash }));
+        setModalOpen(false);
+        pushLog('success', `FUNDS_ADDED: ${short(account)} is now monitored — ${fmtUSD(collateral * (DISPLAY_PRICES[form.asset] ?? 1000))} collateral vs ${fmtUSD(debt)} debt`, hash);
+        void pollPosition(account, 8, 4000).then((fresh) => {
+          if (fresh) {
+            upsert(fresh);
+            pushLog('info', `On-chain state confirmed for ${short(account)}`, hash);
+          }
+        });
+      } catch (e: any) {
+        pushLog('error', `add_monitored_account failed: ${e?.shortMessage ?? e?.message ?? e}`);
+      } finally {
+        setAdding(false);
+      }
+    },
+    [wallet, connectWallet, pushLog, sendWrite, upsert, pollPosition],
+  );
+
+  const resumeProtocol = useCallback(async () => {
+    setResuming(true);
+    pushLog('info', 'resume_protocol() — only the deployer can disengage the circuit breaker…');
+    try {
+      const hash = await sendWrite('resume_protocol', []);
+      for (let i = 0; i < 6; i++) {
+        await sleep(4000);
+        try {
+          const ps = await callView('get_protocol_state', []);
+          const st = typeof ps === 'string' ? JSON.parse(ps) : ps;
+          if (st && typeof st === 'object' && !(st as any).paused) {
+            setPaused(false);
+            pushLog('success', 'PROTOCOL_RESUMED: circuit breaker disengaged — checks are live again', hash);
+            return;
+          }
+        } catch { /* settling */ }
+      }
+      pushLog('warn', 'Resume still settling in consensus — check again shortly');
+    } catch (e: any) {
+      pushLog('error', `resume_protocol failed: ${e?.shortMessage ?? e?.message ?? e}`);
+    } finally {
+      setResuming(false);
+    }
+  }, [pushLog, sendWrite, callView]);
+
+  /* ── derived dashboard data ── */
+
+  const stats = useMemo(() => {
+    const coll = positions.reduce((s, p) => s + p.collateral_amount * (DISPLAY_PRICES[p.collateral_asset] ?? 1000), 0);
+    const debt = positions.reduce((s, p) => s + p.debt_amount, 0);
+    const health = debt > 0 ? Math.round((coll * 100) / debt) : 0;
+    return { coll, debt, health };
+  }, [positions]);
+
+  const allocation = useMemo(() => {
+    const byAsset: Record<string, number> = {};
+    for (const p of positions) {
+      byAsset[p.collateral_asset] = (byAsset[p.collateral_asset] ?? 0) + p.collateral_amount * (DISPLAY_PRICES[p.collateral_asset] ?? 1000);
+    }
+    return Object.entries(byAsset).map(([asset, value]) => ({
+      label: asset,
+      value,
+      color: ASSET_COLORS[asset] ?? '#64748b',
+    }));
+  }, [positions]);
+
+  const healthColor = stats.health >= THRESHOLD ? 'text-emerald-400' : 'text-rose-400';
 
   return (
-    <div className="flex h-screen bg-[#070b14] text-slate-100 font-sans overflow-hidden">
-      
-      <aside className="w-64 bg-[#0d1322] border-r border-slate-800/60 flex flex-col justify-between shrink-0">
-        <div>
-          <div className="p-6 flex items-center space-x-3 border-b border-slate-800/40">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center">
-              <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-              </svg>
-            </div>
-            <div>
-              <h1 className="text-base font-bold text-white">CollateralGuard</h1>
-            </div>
-          </div>
-          <nav className="p-4 space-y-1">
-            <button className="w-full flex items-center space-x-3 px-4 py-3 rounded-xl text-sm font-medium bg-blue-600/15 text-blue-400 border border-blue-500/20">
-              <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" /></svg>
-              <span>Dashboard</span>
-            </button>
-          </nav>
-        </div>
-        <div className="p-4 m-4 rounded-xl bg-slate-900 border border-slate-800">
-          <div className="flex items-center space-x-2 text-xs text-blue-400 mb-1">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-            <span>TESTNET RPC LIVE</span>
-          </div>
-          <p className="text-[10px] text-slate-400 break-all">{CONTRACT_ADDRESS}</p>
-        </div>
-      </aside>
+    <div className="flex min-h-screen bg-[#070b14] text-slate-200">
+      <Sidebar wallet={wallet} />
 
-      <main className="flex-1 flex flex-col overflow-y-auto">
-        <header className="h-16 border-b border-slate-800/60 px-8 flex items-center justify-between bg-[#0b101b]/80 backdrop-blur sticky top-0 z-10">
-          <h2 className="text-lg font-semibold text-white">DeFi Risk Engine</h2>
-          <div className="flex space-x-4">
-             <div className={`px-3 py-1.5 rounded-lg text-xs font-bold border flex items-center space-x-2 ${
-              protocolPaused ? "bg-red-500/10 text-red-400 border-red-500/30" : "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
-            }`}>
-              <span className={`w-2 h-2 rounded-full ${protocolPaused ? "bg-red-400" : "bg-emerald-400"}`}></span>
-              <span>{protocolPaused ? "SYSTEM PAUSED" : "ACTIVE GUARD"}</span>
-            </div>
-            {!walletAddress ? (
-              <button onClick={connectWallet} className="bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold py-2 px-4 rounded-lg">Connect Wallet</button>
+      <main className="min-w-0 flex-1">
+        {/* header */}
+        <header className="flex flex-wrap items-center justify-between gap-4 border-b border-[#131c30] px-6 py-5">
+          <div>
+            <h1 className="text-xl font-semibold text-slate-100">DeFi Risk Engine</h1>
+            <p className="text-xs text-slate-500">
+              CollateralGuard · Intelligent Contracts on {NETWORK_LABEL} (61999)
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="hidden rounded-full border border-[#1b2b47] bg-[#0d1526] px-3 py-1.5 text-[11px] text-slate-400 sm:inline">
+              LIQ threshold <span className="font-semibold text-slate-200">{THRESHOLD}%</span>
+            </span>
+            {wallet ? (
+              <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-1.5 text-xs font-medium text-emerald-400">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                <span className="font-mono">{short(wallet)}</span>
+              </span>
             ) : (
-              <div className="bg-slate-800 border border-slate-700 text-white text-xs font-mono py-2 px-4 rounded-lg">{walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}</div>
+              <button
+                className="rounded-full bg-gradient-to-r from-cyan-500 to-blue-600 px-4 py-1.5 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
+                onClick={() => void connectWallet()}
+                disabled={connecting}
+              >
+                {connecting ? 'Connecting…' : 'Connect Wallet'}
+              </button>
             )}
           </div>
         </header>
 
-        <div className="p-8 space-y-6 max-w-7xl">
-          
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-            <div className="bg-[#0f1627] border border-slate-800/80 p-5 rounded-2xl">
-              <p className="text-xs text-slate-400">Total Monitored Value</p>
-              <h3 className="text-2xl font-bold text-white mt-1">${totalMonitoredValue.toLocaleString(undefined, {minimumFractionDigits: 2})}</h3>
-            </div>
-            <div className="bg-[#0f1627] border border-slate-800/80 p-5 rounded-2xl">
-              <p className="text-xs text-slate-400">Liquidation Threshold</p>
-              <h3 className="text-2xl font-bold text-white mt-1">{globalThreshold}%</h3>
-            </div>
-            <div className="bg-[#0f1627] border border-slate-800/80 p-5 rounded-2xl">
-              <p className="text-xs text-slate-400">Live Asset Prices</p>
-              <div className="mt-2 text-xs font-mono">
-                <div className="flex justify-between text-slate-300"><span>WETH</span><span className="text-white">${oraclePrices.WETH.toLocaleString()}</span></div>
-                <div className="flex justify-between text-slate-300"><span>WBTC</span><span className="text-white">${oraclePrices.WBTC.toLocaleString()}</span></div>
+        <div className="space-y-6 px-6 py-6">
+          {paused && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3">
+              <div className="flex items-center gap-3 text-sm text-rose-300">
+                <span className="h-2 w-2 animate-ping rounded-full bg-rose-400" />
+                <span className="font-semibold">Circuit breaker active</span>
+                <span className="text-rose-300/70">— collateral ratio breached {THRESHOLD}%; all checks revert until resumed.</span>
               </div>
-            </div>
-            <div className="bg-[#0f1627] border border-slate-800/80 p-5 rounded-2xl flex flex-col justify-between">
-              <p className="text-xs text-slate-400 mb-2">Protocol Controls</p>
-              <button onClick={() => setShowAddModal(true)} className="bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold py-2.5 rounded-xl">
-                + Add Account
+              <button
+                className="rounded-lg border border-rose-500/40 px-3 py-1.5 text-xs font-semibold text-rose-300 hover:bg-rose-500/10 disabled:opacity-50"
+                onClick={() => void resumeProtocol()}
+                disabled={resuming}
+              >
+                {resuming ? 'Resuming…' : 'Resume Protocol'}
               </button>
             </div>
+          )}
+
+          {/* stats */}
+          <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
+            {[
+              { label: 'Total Collateral', value: fmtUSD(stats.coll), sub: 'across monitored accounts', accent: 'text-cyan-300' },
+              { label: 'Total Debt', value: fmtUSD(stats.debt), sub: 'USDT denominated', accent: 'text-rose-300' },
+              { label: 'Portfolio Health', value: `${stats.health}%`, sub: `threshold ${THRESHOLD}%`, accent: healthColor },
+              { label: 'Monitored Accounts', value: String(positions.length), sub: paused ? 'protocol paused' : 'protocol operational', accent: 'text-slate-100' },
+            ].map((c) => (
+              <div key={c.label} className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-4">
+                <div className="text-[11px] uppercase tracking-widest text-slate-500">{c.label}</div>
+                <div className={`mt-1.5 text-2xl font-semibold ${c.accent}`}>{c.value}</div>
+                <div className="mt-1 text-[11px] text-slate-600">{c.sub}</div>
+              </div>
+            ))}
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <div className="lg:col-span-6 bg-[#0f1627] border border-slate-800/80 rounded-2xl p-6">
-              <h4 className="text-sm font-semibold text-white mb-4">Collateral Ratio Stability</h4>
-              <div className="h-44 w-full flex items-end relative pt-4">
-                <svg className="w-full h-full overflow-visible" viewBox="0 0 500 150">
-                  <line x1="0" y1="95" x2="500" y2="95" stroke="#ef4444" strokeDasharray="4 4" strokeWidth="1.5" opacity="0.6" />
-                  <text x="10" y="90" fill="#ef4444" fontSize="10" fontFamily="monospace">150% Threshold</text>
-                  <path d="M 0,40 Q 80,20 150,60 T 300,30 T 420,80 T 500,45" fill="none" stroke="#3b82f6" strokeWidth="3" />
-                  {[[0, 40], [80, 20], [150, 60], [220, 45], [300, 30], [360, 55], [420, 80], [500, 45]].map(([cx, cy], i) => (
-                    <circle key={i} cx={cx} cy={cy} r="4" fill="#60a5fa" stroke="#0f1627" strokeWidth="2" />
+          {/* charts */}
+          <div className="grid gap-4 lg:grid-cols-3">
+            <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
+              <div className="mb-3 text-sm font-medium text-slate-300">Asset Allocation</div>
+              <div className="flex items-center gap-4">
+                <Donut
+                  segments={allocation.length ? allocation : [{ label: '—', value: 1, color: '#141d33' }]}
+                  centerLabel={fmtUSD(stats.coll)}
+                  centerSub="collateral"
+                />
+                <div className="space-y-2">
+                  {allocation.map((a) => (
+                    <div key={a.label} className="flex items-center gap-2 text-xs">
+                      <span className="h-2.5 w-2.5 rounded-sm" style={{ background: a.color }} />
+                      <span className="text-slate-300">{a.label}</span>
+                      <span className="text-slate-600">{fmtUSD(a.value)}</span>
+                    </div>
                   ))}
-                </svg>
-              </div>
-            </div>
-
-            <div className="lg:col-span-3 bg-[#0f1627] border border-slate-800/80 rounded-2xl p-6 flex flex-col justify-between">
-              <h4 className="text-sm font-semibold text-white">Asset Allocation</h4>
-              <div className="relative flex items-center justify-center my-2">
-                <svg className="w-32 h-32 transform -rotate-90" viewBox="0 0 36 36">
-                  <path className="text-slate-800" strokeWidth="3.8" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
-                  <path className="text-blue-500" strokeDasharray="65, 100" strokeWidth="3.8" strokeLinecap="round" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
-                </svg>
-                <div className="absolute text-center">
-                  <span className="text-xs text-slate-400 block">Total</span>
-                  <span className="text-sm font-bold text-white font-mono">${totalMonitoredValue > 0 ? "Live" : "0"}</span>
                 </div>
               </div>
             </div>
 
-            <div className="lg:col-span-3 bg-[#0f1627] border border-slate-800/80 rounded-2xl p-6 flex flex-col justify-between">
-              <h4 className="text-sm font-semibold text-white">AI Market Sentiment</h4>
-              <div className="flex flex-col items-center justify-center my-2">
-                <div className="relative w-36 h-20 overflow-hidden flex items-end justify-center">
-                  <div className={"w-36 h-36 rounded-full border-[10px] border-slate-800 border-t-amber-500 border-r-emerald-500 border-l-red-500 absolute top-0 transform -rotate-45"}></div>
-                  <div className="text-center z-10 mb-1">
-                    <span className={`text-base font-bold font-mono ${aiSentiment === "CATASTROPHIC" ? "text-red-400" : "text-emerald-400"}`}>
-                      {aiSentiment}
-                    </span>
+            <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
+              <div className="mb-3 text-sm font-medium text-slate-300">Collateral vs Debt</div>
+              <div className="flex items-center gap-4">
+                <Donut
+                  segments={[
+                    { label: 'Collateral', value: stats.coll, color: '#22d3ee' },
+                    { label: 'Debt', value: stats.debt, color: '#fb7185' },
+                  ]}
+                  centerLabel={`${stats.health}%`}
+                  centerSub="health"
+                />
+                <div className="space-y-2 text-xs">
+                  <div className="flex items-center gap-2">
+                    <span className="h-2.5 w-2.5 rounded-sm bg-cyan-400" />
+                    <span className="text-slate-300">Collateral</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="h-2.5 w-2.5 rounded-sm bg-rose-400" />
+                    <span className="text-slate-300">Debt</span>
+                  </div>
+                  <div className="pt-2 text-[11px] text-slate-600">
+                    Health = collateral ÷ debt. Below {THRESHOLD}% the engine trips the breaker.
                   </div>
                 </div>
               </div>
-              <button onClick={() => setAiSentiment(prev => prev === "NEUTRAL" ? "CATASTROPHIC" : "NEUTRAL")} className="w-full text-xs py-1.5 px-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-300">
-                Toggle Simulator
-              </button>
+            </div>
+
+            <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
+              <div className="mb-1 text-sm font-medium text-slate-300">Portfolio Health — 27h</div>
+              <div className="text-[11px] text-slate-600">simulated timeline · live verdicts mark the current point</div>
+              <div className="mt-2 h-[200px]">
+                <HealthTimeline positions={positions} threshold={THRESHOLD} />
+              </div>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <div className="lg:col-span-7 bg-[#0f1627] border border-slate-800/80 rounded-2xl p-6">
-              <h4 className="text-sm font-semibold text-white mb-4">Monitored Positions</h4>
-              <div className="overflow-x-auto">
-                {positions.length === 0 ? (
-                  <div className="h-32 flex flex-col items-center justify-center text-slate-500 text-sm">
-                    No positions found. Add account to begin.
+          {/* table + terminal */}
+          <div className="grid gap-4 xl:grid-cols-3">
+            <div className="xl:col-span-2">
+              <div className="overflow-hidden rounded-2xl border border-[#131c30] bg-[#0b1120]">
+                <div className="flex items-center justify-between border-b border-[#131c30] px-5 py-3.5">
+                  <div className="text-sm font-medium text-slate-300">Monitored Positions</div>
+                  <div className="flex gap-2">
+                    <button
+                      className="rounded-lg border border-[#1e293b] px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200"
+                      onClick={() => void syncFromChain()}
+                    >
+                      Refresh
+                    </button>
+                    <button
+                      className="rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90"
+                      onClick={() => setModalOpen(true)}
+                    >
+                      + Add Account / Funds
+                    </button>
                   </div>
-                ) : (
+                </div>
+                <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs">
-                    <thead className="text-slate-400 border-b border-slate-800 font-mono">
-                      <tr>
-                        <th className="pb-3">Account</th>
-                        <th className="pb-3">Assets</th>
-                        <th className="pb-3">Ratio</th>
-                        <th className="pb-3 text-right">Actions</th>
+                    <thead>
+                      <tr className="border-b border-[#131c30] text-[10px] uppercase tracking-widest text-slate-600">
+                        <th className="px-5 py-3 font-medium">Account</th>
+                        <th className="px-3 py-3 font-medium">Collateral</th>
+                        <th className="px-3 py-3 font-medium">Debt</th>
+                        <th className="px-3 py-3 font-medium">Ratio</th>
+                        <th className="px-3 py-3 font-medium">Status</th>
+                        <th className="px-5 py-3 text-right font-medium">Engine</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-800/60 font-mono">
-                      {positions.map((pos, idx) => (
-                        <tr key={idx} className="hover:bg-slate-900/40 transition-colors">
-                          <td className="py-3.5 text-slate-200">{pos.address.slice(0,6)}...{pos.address.slice(-4)}</td>
-                          <td className="py-3.5 text-slate-300">{pos.collateralAmount} {pos.collateralAsset} <br/> <span className="text-slate-500 text-[10px]">Debt: {pos.debtAmount}</span></td>
-                          <td className="py-3.5">
-                            <div className="font-bold text-white">{pos.currentRatio}%</div>
-                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                              pos.status === "CRITICAL" ? "bg-red-500/20 text-red-400 border border-red-500/40"
-                              : pos.status === "WARNING" ? "bg-amber-500/20 text-amber-400 border border-amber-500/40"
-                              : "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40"
-                            }`}>
-                              {pos.status}
-                            </span>
+                    <tbody>
+                      {positions.map((p) => (
+                        <tr key={p.address} className="border-b border-[#0e1526] last:border-0 hover:bg-[#0d1526]/60">
+                          <td className="px-5 py-3.5">
+                            <div className="font-mono text-slate-200">{short(p.address)}</div>
+                            <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-slate-600">
+                              {p.localOnly ? 'local preview' : 'on-chain'}
+                              {txByAccount[p.address] && (
+                                <a
+                                  href={`${EXPLORER_TX}${txByAccount[p.address]}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="text-cyan-500 underline decoration-dotted hover:text-cyan-400"
+                                >
+                                  tx ↗
+                                </a>
+                              )}
+                            </div>
                           </td>
-                          <td className="py-3.5 text-right">
-                            <button onClick={() => handleCheckAndProtect(pos.address)} className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg">
-                              Run Check()
+                          <td className="px-3 py-3.5">
+                            <span className="font-semibold text-slate-200">{p.collateral_amount}</span>{' '}
+                            <span className="text-slate-500">{p.collateral_asset}</span>
+                            <div className="text-[10px] text-slate-600">
+                              {fmtUSD(p.collateral_amount * (DISPLAY_PRICES[p.collateral_asset] ?? 1000))}
+                            </div>
+                          </td>
+                          <td className="px-3 py-3.5 text-slate-400">{fmtUSD(p.debt_amount)}</td>
+                          <td className="px-3 py-3.5">
+                            <div className={`font-semibold ${p.last_ratio >= THRESHOLD ? 'text-emerald-400' : p.last_ratio > 0 ? 'text-rose-400' : 'text-slate-500'}`}>
+                              {p.last_ratio > 0 ? `${p.last_ratio}%` : '—'}
+                            </div>
+                            <div className="relative mt-1 h-1.5 w-20 rounded bg-[#141d33]">
+                              <div
+                                className={`h-1.5 rounded ${p.last_ratio >= THRESHOLD ? 'bg-emerald-400' : 'bg-rose-400'}`}
+                                style={{ width: `${Math.min(100, (p.last_ratio / 300) * 100)}%` }}
+                              />
+                              <div className="absolute -top-1 h-3.5 w-px bg-rose-400/60" style={{ left: `${(THRESHOLD / 300) * 100}%` }} />
+                            </div>
+                          </td>
+                          <td className="px-3 py-3.5">
+                            <StatusBadge status={p.status} />
+                            <div className="mt-1 max-w-[220px] truncate text-[10px] text-slate-600" title={p.last_message}>
+                              {p.last_message}
+                            </div>
+                          </td>
+                          <td className="px-5 py-3.5 text-right">
+                            <button
+                              className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-40"
+                              onClick={() => void runCheck(p)}
+                              disabled={checkingAddr !== null}
+                            >
+                              {checkingAddr === p.address ? 'Validators…' : 'Run Check()'}
                             </button>
+                            <div className="mt-1 text-[10px] text-slate-600">{p.last_checked}</div>
                           </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                )}
+                </div>
               </div>
             </div>
 
-            <div className="lg:col-span-5 bg-[#0a0f18] border border-slate-800/80 rounded-2xl flex flex-col h-72">
-              <div className="bg-[#111827] px-4 py-2 border-b border-slate-800 flex items-center">
-                <span className="text-[10px] text-slate-500 font-mono">genvm-node-execution.log</span>
-              </div>
-              <div className="p-4 flex-1 overflow-y-auto font-mono text-[11px] space-y-3">
-                {statusLog.map((log, i) => (
-                  <div key={i} className="flex flex-col">
-                    <div className="flex space-x-2">
-                      <span className="text-slate-500 shrink-0">[{log.time}]</span>
-                      <span className={`${log.type === "danger" ? "text-red-400" : log.type === "warn" ? "text-amber-400" : log.type === "success" ? "text-emerald-400" : "text-blue-300"}`}>
-                        {log.msg}
-                      </span>
-                    </div>
-                    {log.hash && (
-                      <a href={`https://explorer.genlayer.com/tx/${log.hash}`} target="_blank" rel="noreferrer" className="ml-14 text-blue-400 hover:text-blue-300 underline decoration-dotted mt-1">
-                        View Tx on Explorer ↗
-                      </a>
-                    )}
-                  </div>
-                ))}
-                <div ref={logsEndRef} />
-              </div>
-            </div>
+            <Terminal logs={logs} termRef={termRef} />
           </div>
         </div>
       </main>
 
-      {showAddModal && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-[#0f1627] border border-slate-800 rounded-2xl p-6 w-full max-w-md">
-            <h3 className="text-base font-bold text-white mb-4">Execute add_monitored_account</h3>
-            <form onSubmit={handleAddAccount} className="space-y-4">
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-[11px] font-mono text-slate-400">Asset</label>
-                  <select value={modalCollAsset} onChange={(e) => setModalCollAsset(e.target.value)} className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-white">
-                    <option value="WETH">WETH (${oraclePrices.WETH.toLocaleString()})</option>
-                    <option value="WBTC">WBTC (${oraclePrices.WBTC.toLocaleString()})</option>
-                    <option value="SOL">SOL (${oraclePrices.SOL.toLocaleString()})</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-[11px] font-mono text-slate-400">Deposit</label>
-                  <input type="number" step="any" required placeholder="10" value={modalCollateral} onChange={(e) => setModalCollateral(e.target.value)} className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-white"/>
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-[11px] font-mono text-slate-400">Debt Asset</label>
-                  <input type="text" disabled value="USDC ($1.00)" className="w-full mt-1 bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-slate-500 cursor-not-allowed"/>
-                </div>
-                <div>
-                  <label className="text-[11px] font-mono text-slate-400">Borrow Amount</label>
-                  <input type="number" step="any" required placeholder="5000" value={modalDebt} onChange={(e) => setModalDebt(e.target.value)} className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-white"/>
-                </div>
-              </div>
-              <div className="flex justify-end space-x-2 pt-2">
-                <button type="button" onClick={() => setShowAddModal(false)} disabled={isTxPending} className="px-4 py-2 bg-slate-800 text-xs font-semibold rounded-xl text-slate-300">
-                  Cancel
-                </button>
-                <button type="submit" disabled={isTxPending} className="px-4 py-2 bg-blue-600 text-xs font-semibold rounded-xl text-white">
-                  {isTxPending ? "Awaiting Wallet..." : "Sign Transaction"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+      {modalOpen && (
+        <AddFundsModal
+          defaultAccount={wallet ?? ''}
+          pending={adding}
+          onClose={() => setModalOpen(false)}
+          onSubmit={(f) => void submitAddFunds(f)}
+        />
       )}
     </div>
   );
