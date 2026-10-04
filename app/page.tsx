@@ -10,13 +10,12 @@
  *   3. IMPORTANT: keep the address CHECKSUMMED exactly as the explorer shows it.
  *      The hosted Studio node performs a case-sensitive contract lookup.
  *
- * TRANSACTION CLASSIFICATION (verified live against Studionet getTransaction):
- *   • A reverted call still reaches ACCEPTED/FINALIZED — consensus "MAJORITY_AGREE"
- *     on an errored execution. The discriminator is leader_receipt[0].result.status:
- *     "contract_error" = reverted, otherwise executed.
- *   • The human-readable revert reason lives in genvm_result.stderr
- *     ("Exception: <reason>"); the on-chain return value of a successful write
- *     is calldata-encoded in result.raw.
+ * NOTES (all verified live against Studionet):
+ *   • A reverted call still reaches FINALIZED — classification comes from
+ *     leader_receipt[0].result.status ("contract_error") and the human-readable
+ *     reason from genvm_result.stderr ("Exception: <reason>").
+ *   • Successful writes return the calldata-encoded return string in result.raw.
+ *   • Transaction cards are persisted to localStorage so history survives refresh.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -33,15 +32,16 @@ declare global {
 
 const DEFAULT_CONTRACT_ADDRESS = '0xaCBd7A2861E5f41276F17ffCF0881906798988C4';
 const ADDRESS_STORAGE_KEY = 'cg_contract_address';
+const ADDRESS_HISTORY_KEY = 'cg_address_history';
+const TXS_STORAGE_KEY = 'cg_txs';
 
 const NETWORK_LABEL = 'GenLayer Studionet';
 const EXPLORER_TX = 'https://explorer-studio.genlayer.com/tx/';
-const THRESHOLD = 150;
+const DEFAULT_THRESHOLD = 150;
 
 const DISPLAY_PRICES: Record<string, number> = { ETH: 3200, BTC: 64000, SOL: 150, WETH: 3200 };
 const ASSET_COLORS: Record<string, string> = { ETH: '#627eea', WETH: '#627eea', BTC: '#f7931a', SOL: '#14f195' };
 
-// Live dashboard prices (display-only — on-chain verdicts use the validators' own feed)
 const COINGECKO_IDS: Record<string, string> = { ETH: 'ethereum', WETH: 'ethereum', BTC: 'bitcoin', SOL: 'solana' };
 
 type GenClient = ReturnType<typeof createClient>;
@@ -157,13 +157,24 @@ type ProtocolState = {
   total_checks: string | number;
 };
 
-type TxState = 'IN_FLIGHT' | 'EXECUTED' | 'REVERTED';
+type CheckEvent = {
+  seq: number;
+  account: string;
+  asset: string;
+  ratio: number;
+  status: string;
+  price_source?: string;
+  message: string;
+};
+
+type TxState = 'IN_FLIGHT' | 'EXECUTED' | 'REVERTED' | 'STALE';
 
 type TxRecord = {
   hash: string;
   method: string;
   argsSummary: string;
   time: string;
+  ts: number;
   state: TxState;
   chainStatus: string;
   votesAgree: number;
@@ -221,9 +232,34 @@ const TX_STATE_PILL: Record<TxState, string> = {
   IN_FLIGHT: 'bg-amber-500/10 text-amber-300 border-amber-500/30',
   EXECUTED: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
   REVERTED: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
+  STALE: 'bg-slate-500/10 text-slate-400 border-slate-500/30',
 };
 
 type Tab = 'dashboard' | 'accounts' | 'risk' | 'transactions' | 'settings';
+
+function loadPersistedTxs(): TxRecord[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(TXS_STORAGE_KEY);
+    if (!raw) return [];
+    const list = JSON.parse(raw) as TxRecord[];
+    const tenMin = Date.now() - 10 * 60 * 1000;
+    return list.map((t) => (t.state === 'IN_FLIGHT' && (t.ts ?? 0) < tenMin ? { ...t, state: 'STALE' as TxState } : t));
+  } catch {
+    return [];
+  }
+}
+
+function loadAddressHistory(): string[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(ADDRESS_HISTORY_KEY);
+    const list = raw ? (JSON.parse(raw) as string[]) : [];
+    return Array.isArray(list) ? list.filter((a) => /^0x[0-9a-fA-F]{40}$/.test(a)).slice(0, 5) : [];
+  } catch {
+    return [];
+  }
+}
 
 /* ─────────────────────────── SVG components ─────────────────────────── */
 
@@ -267,8 +303,21 @@ function Donut({
   );
 }
 
-function HealthTimeline({ positions, threshold, prices }: { positions: Position[]; threshold: number; prices: Record<string, number> }) {
+/** Real check-history timeline; falls back to a simulated walk until 2+ checks exist. */
+function HealthTimeline({
+  positions, threshold, prices, history,
+}: {
+  positions: Position[];
+  threshold: number;
+  prices: Record<string, number>;
+  history: CheckEvent[];
+}) {
+  const real = history.length >= 2;
   const series = useMemo(() => {
+    if (real) {
+      const pts = history.slice(-20).map((h) => ({ v: Math.min(340, Math.max(60, h.ratio)), label: `#${h.seq}` }));
+      return { pts: pts.map((p) => p.v), current: pts.length ? pts[pts.length - 1].v : 0, labels: pts.map((p) => p.label) };
+    }
     const coll = positions.reduce((s, p) => s + p.collateral_amount * (prices[p.collateral_asset] ?? 1000), 0);
     const debt = Math.max(1, positions.reduce((s, p) => s + p.debt_amount, 0));
     const current = Math.min(340, Math.max(90, Math.round((coll * 100) / debt)));
@@ -284,19 +333,19 @@ function HealthTimeline({ positions, threshold, prices }: { positions: Position[
       pts.push(v);
     }
     pts.push(current);
-    return { pts, current };
-  }, [positions, prices]);
+    return { pts, current, labels: [] as string[] };
+  }, [real, history, positions, prices]);
 
   const W = 640;
   const H = 220;
   const y = (v: number) => 200 - ((v - 80) / 260) * 184;
-  const x = (i: number, n: number) => 40 + (i * (W - 80)) / (n - 1);
-  const line = series.pts.map((p, i) => `${x(i, series.pts.length)},${y(p)}`).join(' ');
-  const area = `M ${x(0, series.pts.length)},${y(series.pts[0])} `
-    + series.pts.slice(1).map((p, i) => `L ${x(i + 1, series.pts.length)},${y(p)}`).join(' ')
-    + ` L ${x(series.pts.length - 1, series.pts.length)},200 L ${x(0, series.pts.length)},200 Z`;
-  const lastX = x(series.pts.length - 1, series.pts.length);
-  const lastY = y(series.pts[series.pts.length - 1]);
+  const n = series.pts.length;
+  const x = (i: number) => 40 + (i * (W - 80)) / Math.max(1, n - 1);
+  const line = series.pts.map((p, i) => `${x(i)},${y(p)}`).join(' ');
+  const area = `M ${x(0)},${y(series.pts[0])} `
+    + series.pts.slice(1).map((p, i) => `L ${x(i + 1)},${y(p)}`).join(' ')
+    + ` L ${x(n - 1)},200 L ${x(0)},200 Z`;
+  const lastY = y(series.pts[n - 1]);
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="h-full w-full">
@@ -316,14 +365,16 @@ function HealthTimeline({ positions, threshold, prices }: { positions: Position[
       <text x={44} y={y(threshold) - 5} fontSize="9" fill="#fb7185">LIQ THRESHOLD {threshold}%</text>
       <path d={area} fill="url(#healthFill)" />
       <polyline points={line} fill="none" stroke="#22d3ee" strokeWidth="2" strokeLinejoin="round" />
-      <circle cx={lastX} cy={lastY} r="4" fill="#22d3ee" />
-      <circle cx={lastX} cy={lastY} r="8" fill="#22d3ee" opacity="0.25" />
-      <text x={lastX - 8} y={lastY - 12} textAnchor="end" fontSize="12" fontWeight="600" fill="#e2e8f0">
+      {real && series.pts.map((p, i) => (
+        <circle key={i} cx={x(i)} cy={y(p)} r="2.5" fill={p < threshold ? '#fb7185' : '#22d3ee'} />
+      ))}
+      <circle cx={x(n - 1)} cy={lastY} r="4" fill="#22d3ee" />
+      <circle cx={x(n - 1)} cy={lastY} r="8" fill="#22d3ee" opacity="0.25" />
+      <text x={x(n - 1) - 8} y={lastY - 12} textAnchor="end" fontSize="12" fontWeight="600" fill="#e2e8f0">
         {series.current}%
       </text>
-      <text x={40} y={216} fontSize="9" fill="#334155">27h ago</text>
-      <text x={W / 2} y={216} fontSize="9" fill="#334155" textAnchor="middle">14h ago</text>
-      <text x={W - 20} y={216} fontSize="9" fill="#334155" textAnchor="end">now</text>
+      <text x={40} y={216} fontSize="9" fill="#334155">{real ? 'check #1' : '27h ago'}</text>
+      <text x={W - 20} y={216} fontSize="9" fill="#334155" textAnchor="end">{real ? `check #${history[history.length - 1]?.seq ?? n}` : 'now'}</text>
     </svg>
   );
 }
@@ -401,41 +452,67 @@ function Sidebar({ wallet, tab, onTab }: { wallet: string | null; tab: Tab; onTa
   );
 }
 
-function Terminal({ logs, termRef }: { logs: LogEntry[]; termRef: React.RefObject<HTMLDivElement | null> }) {
-  const color: Record<LogLevel, string> = {
-    info: 'text-slate-300',
-    success: 'text-emerald-400',
-    warn: 'text-amber-300',
-    error: 'text-rose-400',
-    ai: 'text-cyan-300',
-  };
+const LEVEL_META: Record<LogLevel, { dot: string; text: string; label: string }> = {
+  info: { dot: 'bg-slate-500', text: 'text-slate-300', label: 'INFO' },
+  success: { dot: 'bg-emerald-400', text: 'text-slate-200', label: 'OK' },
+  warn: { dot: 'bg-amber-400', text: 'text-amber-200', label: 'WARN' },
+  error: { dot: 'bg-rose-500', text: 'text-rose-200', label: 'ERROR' },
+  ai: { dot: 'bg-cyan-400', text: 'text-cyan-200', label: 'CONSENSUS' },
+};
+
+/** Professional activity feed (replaces the raw terminal look). */
+function ActivityPanel({
+  logs, termRef, onClear,
+}: {
+  logs: LogEntry[];
+  termRef: React.RefObject<HTMLDivElement | null>;
+  onClear: () => void;
+}) {
   return (
-    <div className="flex h-full min-h-[420px] flex-col overflow-hidden rounded-2xl border border-[#131c30] bg-[#090e1a]">
-      <div className="flex items-center gap-2 border-b border-[#131c30] px-4 py-3">
-        <span className="h-2 w-2 rounded-full bg-emerald-400" />
-        <span className="text-[11px] font-medium uppercase tracking-widest text-slate-400">
-          Terminal — genvm://collateralguard
-        </span>
+    <div className="flex h-full min-h-[420px] flex-col overflow-hidden rounded-2xl border border-[#131c30] bg-[#0b1120]">
+      <div className="flex items-center justify-between border-b border-[#131c30] bg-gradient-to-r from-[#0d1526] to-transparent px-4 py-3">
+        <div className="flex items-center gap-2">
+          <span className="flex h-5 w-5 items-center justify-center rounded-md bg-cyan-500/15">
+            <svg viewBox="0 0 24 24" className="h-3 w-3 text-cyan-400" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M4 6h16M4 12h10M4 18h7" strokeLinecap="round" />
+            </svg>
+          </span>
+          <span className="text-[11px] font-semibold uppercase tracking-widest text-slate-300">Engine Activity</span>
+        </div>
+        <button
+          className="rounded-md border border-[#1e293b] px-2 py-1 text-[10px] text-slate-500 hover:text-slate-300"
+          onClick={onClear}
+        >
+          Clear
+        </button>
       </div>
-      <div ref={termRef} className="flex-1 space-y-1.5 overflow-y-auto px-4 py-3 font-mono text-[11px] leading-relaxed">
-        {logs.length === 0 && <div className="text-slate-600">Booting…</div>}
-        {logs.map((l) => (
-          <div key={l.id} className="flex flex-wrap gap-x-2">
-            <span className="text-slate-600">[{l.time}]</span>
-            <span className="text-slate-700">▸</span>
-            <span className={color[l.level]}>{l.msg}</span>
-            {l.txHash && (
-              <a
-                href={`${EXPLORER_TX}${l.txHash}`}
-                target="_blank"
-                rel="noreferrer"
-                className="text-cyan-400 underline decoration-dotted underline-offset-2 hover:text-cyan-300"
-              >
-                {short(l.txHash)} ↗
-              </a>
-            )}
-          </div>
-        ))}
+      <div ref={termRef} className="flex-1 space-y-0.5 overflow-y-auto px-3 py-2">
+        {logs.length === 0 && <div className="px-2 py-6 text-center text-[11px] text-slate-600">No activity yet</div>}
+        {logs.map((l) => {
+          const meta = LEVEL_META[l.level];
+          return (
+            <div key={l.id} className="group flex items-start gap-2.5 rounded-lg px-2 py-1.5 hover:bg-[#0d1526]/70">
+              <span className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} />
+              <div className="min-w-0 flex-1">
+                <div className="text-[11.5px] leading-snug text-slate-300">{l.msg}</div>
+                <div className="mt-0.5 flex items-center gap-2 text-[9px] uppercase tracking-wider text-slate-600">
+                  <span>{meta.label}</span>
+                  <span>{l.time}</span>
+                  {l.txHash && (
+                    <a
+                      href={`${EXPLORER_TX}${l.txHash}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-mono normal-case text-cyan-500 underline decoration-dotted hover:text-cyan-400"
+                    >
+                      {short(l.txHash)} ↗
+                    </a>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -479,6 +556,12 @@ function TxCard({ tx }: { tx: TxRecord }) {
       {tx.state === 'IN_FLIGHT' && (
         <div className="mt-2 text-[11px] text-amber-300/80">
           Validators are executing this call — LLM consensus can take up to a minute.
+        </div>
+      )}
+
+      {tx.state === 'STALE' && (
+        <div className="mt-2 text-[11px] text-slate-400">
+          No final update received — the transaction may have been replaced or dropped in MetaMask. Check the explorer.
         </div>
       )}
 
@@ -561,13 +644,14 @@ function AddFundsModal({
 }
 
 function PositionsTable({
-  positions, txByAccount, checkingAddr, onCheck, priceOf,
+  positions, txByAccount, checkingAddr, onCheck, priceOf, threshold,
 }: {
   positions: Position[];
   txByAccount: Record<string, string>;
   checkingAddr: string | null;
   onCheck: (p: Position) => void;
   priceOf: (asset: string) => number;
+  threshold: number;
 }) {
   return (
     <div className="overflow-hidden rounded-2xl border border-[#131c30] bg-[#0b1120]">
@@ -615,15 +699,15 @@ function PositionsTable({
                 </td>
                 <td className="px-3 py-3.5 text-slate-400">{fmtUSD(p.debt_amount)}</td>
                 <td className="px-3 py-3.5">
-                  <div className={`font-semibold ${p.last_ratio >= THRESHOLD ? 'text-emerald-400' : p.last_ratio > 0 ? 'text-rose-400' : 'text-slate-500'}`}>
+                  <div className={`font-semibold ${p.last_ratio >= threshold ? 'text-emerald-400' : p.last_ratio > 0 ? 'text-rose-400' : 'text-slate-500'}`}>
                     {p.last_ratio > 0 ? `${p.last_ratio}%` : '—'}
                   </div>
                   <div className="relative mt-1 h-1.5 w-20 rounded bg-[#141d33]">
                     <div
-                      className={`h-1.5 rounded ${p.last_ratio >= THRESHOLD ? 'bg-emerald-400' : 'bg-rose-400'}`}
+                      className={`h-1.5 rounded ${p.last_ratio >= threshold ? 'bg-emerald-400' : 'bg-rose-400'}`}
                       style={{ width: `${Math.min(100, (p.last_ratio / 300) * 100)}%` }}
                     />
-                    <div className="absolute -top-1 h-3.5 w-px bg-rose-400/60" style={{ left: `${(THRESHOLD / 300) * 100}%` }} />
+                    <div className="absolute -top-1 h-3.5 w-px bg-rose-400/60" style={{ left: `${(threshold / 300) * 100}%` }} />
                   </div>
                 </td>
                 <td className="px-3 py-3.5">
@@ -659,23 +743,27 @@ export default function Page() {
   const [connecting, setConnecting] = useState(false);
   const [positions, setPositions] = useState<Position[]>(SEED_POSITIONS);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [txs, setTxs] = useState<TxRecord[]>([]);
+  const [txs, setTxs] = useState<TxRecord[]>(loadPersistedTxs);
   const [modalOpen, setModalOpen] = useState(false);
   const [adding, setAdding] = useState(false);
   const [checkingAddr, setCheckingAddr] = useState<string | null>(null);
   const [resuming, setResuming] = useState(false);
   const [protocol, setProtocol] = useState<ProtocolState | null>(null);
+  const [history, setHistory] = useState<CheckEvent[]>([]);
   const [txByAccount, setTxByAccount] = useState<Record<string, string>>({});
   const [contractAddr, setContractAddr] = useState(DEFAULT_CONTRACT_ADDRESS);
   const [addrInput, setAddrInput] = useState(DEFAULT_CONTRACT_ADDRESS);
+  const [addrHistory, setAddrHistory] = useState<string[]>(loadAddressHistory);
   const [livePrices, setLivePrices] = useState<Record<string, number> | null>(null);
   const [priceStamp, setPriceStamp] = useState<string | null>(null);
 
   const writeClientRef = useRef<GenClient | null>(null);
   const logIdRef = useRef(1);
+  const connectingRef = useRef(false);
   const termRef = useRef<HTMLDivElement | null>(null);
 
   const paused = protocol?.paused === true;
+  const liveThreshold = asNum(protocol?.threshold) || DEFAULT_THRESHOLD;
 
   const pushLog = useCallback((level: LogLevel, msg: string, txHash?: string) => {
     setLogs((prev) => [
@@ -693,20 +781,26 @@ export default function Page() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [logs]);
 
+  // persist the transaction panel across refreshes
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(TXS_STORAGE_KEY, JSON.stringify(txs.slice(0, 40)));
+    } catch { /* quota — ignore */ }
+  }, [txs]);
+
+  // single boot effect: apply the saved address first, then log once
   useEffect(() => {
     const saved = window.localStorage.getItem(ADDRESS_STORAGE_KEY);
+    let addr = DEFAULT_CONTRACT_ADDRESS;
     if (saved && /^0x[0-9a-fA-F]{40}$/.test(saved)) {
+      addr = saved;
       setContractAddr(saved);
       setAddrInput(saved);
     }
     pushLog('info', 'CollateralGuard risk engine online — GenLayer Intelligent Consensus ready');
+    pushLog('info', `Target contract: ${short(addr)} on ${NETWORK_LABEL} (61999)`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    pushLog('info', `Target contract: ${short(contractAddr)} on ${NETWORK_LABEL} (61999)`);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contractAddr]);
 
   /* ── live market prices for the dashboard (display-only) ── */
 
@@ -765,6 +859,16 @@ export default function Page() {
     }
   }, [callView]);
 
+  const refreshHistory = useCallback(async () => {
+    try {
+      const raw = await callView('get_check_history', [20]);
+      const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (Array.isArray(list)) setHistory(list as CheckEvent[]);
+    } catch {
+      /* history view needs the v3 contract — ignore on older deployments */
+    }
+  }, [callView]);
+
   const syncFromChain = useCallback(async () => {
     try {
       const raw = await callView('get_all_accounts', []);
@@ -773,9 +877,11 @@ export default function Page() {
         setPositions(list.map((r: any) => ({ ...r, address: r.address, localOnly: false }) as Position));
         pushLog('success', `Synced ${list.length} monitored account(s) from GenVM state`);
       } else if (Array.isArray(list)) {
-        pushLog('info', 'Contract is live on-chain with no monitored accounts yet — add one to begin');
+        setPositions((prev) => (prev.length ? prev : []));
+        pushLog('info', 'This contract has no monitored accounts yet — add one to begin');
       }
       await refreshProtocolState();
+      await refreshHistory();
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (/not found/i.test(msg)) {
@@ -784,7 +890,7 @@ export default function Page() {
         pushLog('error', `Chain read failed: ${msg.slice(0, 160)}`);
       }
     }
-  }, [callView, pushLog, refreshProtocolState, contractAddr]);
+  }, [callView, pushLog, refreshProtocolState, refreshHistory, contractAddr]);
 
   /** Broadcast a write and register it in the live transaction panel. */
   const sendWrite = useCallback(
@@ -802,6 +908,7 @@ export default function Page() {
         method,
         argsSummary: args.map((a) => (typeof a === 'string' && a.startsWith('0x') ? short(a) : String(a))).join(', '),
         time: new Date().toLocaleTimeString('en-GB'),
+        ts: Date.now(),
         state: 'IN_FLIGHT',
         chainStatus: 'PENDING',
         votesAgree: 0,
@@ -816,8 +923,8 @@ export default function Page() {
 
   /**
    * Poll the chain until the tx settles, classifying the REAL execution
-   * outcome (a reverted call still reaches FINALIZED — "ACCEPTED" alone
-   * proves nothing). Updates the transaction panel live while polling.
+   * outcome. Marks the record STALE if nothing settles in time (typically a
+   * MetaMask "replace"/drop).
    */
   const trackTx = useCallback(
     async (hash: string, attempts = 60, delayMs = 3000): Promise<TxRecord> => {
@@ -825,7 +932,7 @@ export default function Page() {
       for (let i = 0; i < attempts; i++) {
         await sleep(delayMs);
         try {
-         const t: any = await getReadClient().getTransaction({ hash: hash as any });
+          const t: any = await getReadClient().getTransaction({ hash: hash as any });
           if (!t) continue;
           const statusNum = Number(t.status);
           const chainStatus = STATUS_NAMES[statusNum] ?? String(t.statusName ?? statusNum);
@@ -850,7 +957,7 @@ export default function Page() {
               'execution error';
             patch.state = 'REVERTED';
             patch.revertReason = reason;
-            latest = { hash, method: '', argsSummary: '', time: '', state: 'REVERTED', chainStatus, votesAgree: agree, votesTotal: voteVals.length, revertReason: reason };
+            latest = { hash, method: '', argsSummary: '', time: '', ts: Date.now(), state: 'REVERTED', chainStatus, votesAgree: agree, votesTotal: voteVals.length, revertReason: reason };
             updateTx(hash, patch);
             return latest;
           }
@@ -859,7 +966,7 @@ export default function Page() {
             const output = leader?.result?.raw ? decodeReturnPayload(String(leader.result.raw)) : undefined;
             patch.state = 'EXECUTED';
             patch.output = output;
-            latest = { hash, method: '', argsSummary: '', time: '', state: 'EXECUTED', chainStatus, votesAgree: agree, votesTotal: voteVals.length, output };
+            latest = { hash, method: '', argsSummary: '', time: '', ts: Date.now(), state: 'EXECUTED', chainStatus, votesAgree: agree, votesTotal: voteVals.length, output };
             updateTx(hash, patch);
             return latest;
           }
@@ -869,7 +976,8 @@ export default function Page() {
           /* not indexed yet — keep polling */
         }
       }
-      return latest ?? { hash, method: '', argsSummary: '', time: '', state: 'IN_FLIGHT', chainStatus: 'PENDING', votesAgree: 0, votesTotal: 0 };
+      updateTx(hash, { state: 'STALE' });
+      return latest ?? { hash, method: '', argsSummary: '', time: '', ts: Date.now(), state: 'STALE', chainStatus: 'UNKNOWN', votesAgree: 0, votesTotal: 0 };
     },
     [updateTx],
   );
@@ -896,12 +1004,14 @@ export default function Page() {
   /* ── wallet ── */
 
   const connectWallet = useCallback(async (): Promise<string | null> => {
+    if (connectingRef.current) return wallet;
     const eth = window.ethereum;
     if (!eth) {
       pushLog('error', 'MetaMask not detected — install it to interact with GenLayer');
       return null;
     }
     try {
+      connectingRef.current = true;
       setConnecting(true);
       const accounts: string[] = await eth.request({ method: 'eth_requestAccounts' });
       const addr = accounts?.[0] ?? null;
@@ -922,9 +1032,17 @@ export default function Page() {
       pushLog('error', `Wallet connection failed: ${e?.shortMessage ?? e?.message ?? e}`);
       return null;
     } finally {
+      connectingRef.current = false;
       setConnecting(false);
     }
-  }, [pushLog, syncFromChain]);
+  }, [wallet, pushLog, syncFromChain]);
+
+  const disconnectWallet = useCallback(() => {
+    writeClientRef.current = null;
+    setWallet(null);
+    setProtocol(null);
+    pushLog('warn', 'Wallet disconnected');
+  }, [pushLog]);
 
   useEffect(() => {
     const eth = window.ethereum;
@@ -932,13 +1050,13 @@ export default function Page() {
     eth
       .request({ method: 'eth_accounts' })
       .then((accs: string[]) => {
-        if (accs?.length) void connectWallet();
+        if (accs?.length && !connectingRef.current) void connectWallet();
       })
       .catch(() => {});
     const onAccounts = (accs: string[]) => {
       if (!accs?.length) {
-        setWallet(null);
         writeClientRef.current = null;
+        setWallet(null);
         pushLog('warn', 'Wallet disconnected');
       } else {
         setWallet(accs[0]);
@@ -985,7 +1103,7 @@ export default function Page() {
         }
 
         const before = await callView('get_position_status', [target.address]).catch(() => undefined);
-        pushLog('ai', `check_and_protect(${short(target.address)}) → validators fetching ${target.collateral_asset} price via Binance, then LLM consensus…`);
+        pushLog('ai', `check_and_protect(${short(target.address)}) → validators fetching ${target.collateral_asset} price, then LLM consensus…`);
         const hash = await sendWrite('check_and_protect', [target.address]);
         const outcome = await trackTx(hash);
 
@@ -1010,6 +1128,7 @@ export default function Page() {
           const level: LogLevel = fresh.status === 'CRITICAL' ? 'error' : fresh.status === 'WARNING' ? 'warn' : 'success';
           pushLog(level, verdict, hash);
           await refreshProtocolState();
+          await refreshHistory();
           if (fresh.status === 'CRITICAL') {
             pushLog('error', 'CIRCUIT BREAKER ENGAGED — every further check() will revert until the owner resumes the protocol');
           }
@@ -1022,7 +1141,7 @@ export default function Page() {
         setCheckingAddr(null);
       }
     },
-    [wallet, connectWallet, pushLog, sendWrite, trackTx, pollPosition, upsert, callView, refreshProtocolState],
+    [wallet, connectWallet, pushLog, sendWrite, trackTx, pollPosition, upsert, callView, refreshProtocolState, refreshHistory],
   );
 
   const submitAddFunds = useCallback(
@@ -1103,17 +1222,49 @@ export default function Page() {
     }
   }, [pushLog, sendWrite, trackTx, refreshProtocolState]);
 
-  const saveAddress = useCallback(() => {
-    const v = addrInput.trim();
-    if (!/^0x[0-9a-fA-F]{40}$/.test(v)) {
-      pushLog('error', 'That is not a valid 20-byte address (0x + 40 hex chars)');
-      return;
-    }
-    window.localStorage.setItem(ADDRESS_STORAGE_KEY, v);
-    setContractAddr(v);
-    pushLog('info', `Contract address updated to ${short(v)} — syncing…`);
-    void syncFromChain();
-  }, [addrInput, pushLog, syncFromChain]);
+  const updateThreshold = useCallback(
+    async (value: number) => {
+      if (!wallet) {
+        pushLog('error', 'Connect the deployer wallet first');
+        return;
+      }
+      setResuming(true);
+      try {
+        const hash = await sendWrite('set_threshold', [Math.round(value)]);
+        const outcome = await trackTx(hash);
+        if (outcome.state === 'REVERTED') {
+          pushLog('error', `set_threshold REVERTED on-chain: ${outcome.revertReason ?? 'contract error'}`, hash);
+          return;
+        }
+        pushLog('success', outcome.output ?? `THRESHOLD_UPDATED: liquidation threshold is now ${Math.round(value)}%`, hash);
+        await refreshProtocolState();
+      } catch (e: any) {
+        pushLog('error', `set_threshold failed: ${e?.shortMessage ?? e?.message ?? e}`);
+      } finally {
+        setResuming(false);
+      }
+    },
+    [wallet, pushLog, sendWrite, trackTx, refreshProtocolState],
+  );
+
+  const switchAddress = useCallback(
+    (addr: string) => {
+      const v = addr.trim();
+      if (!/^0x[0-9a-fA-F]{40}$/.test(v)) {
+        pushLog('error', 'That is not a valid 20-byte address (0x + 40 hex chars)');
+        return;
+      }
+      window.localStorage.setItem(ADDRESS_STORAGE_KEY, v);
+      const hist = [v, ...addrHistory.filter((a) => a.toLowerCase() !== v.toLowerCase())].slice(0, 5);
+      window.localStorage.setItem(ADDRESS_HISTORY_KEY, JSON.stringify(hist));
+      setAddrHistory(hist);
+      setContractAddr(v);
+      setAddrInput(v);
+      pushLog('info', `Contract address set to ${short(v)} — syncing…`);
+      void syncFromChain();
+    },
+    [addrHistory, pushLog, syncFromChain],
+  );
 
   /* ── derived dashboard data ── */
 
@@ -1136,12 +1287,20 @@ export default function Page() {
     }));
   }, [positions, priceOf]);
 
-  const healthColor = stats.health >= THRESHOLD ? 'text-emerald-400' : 'text-rose-400';
+  const healthColor = stats.health >= liveThreshold ? 'text-emerald-400' : 'text-rose-400';
   const unconfigured = contractAddr === '0x0000000000000000000000000000000000000000';
   const inFlight = txs.filter((t) => t.state === 'IN_FLIGHT').length;
+  const otherAddresses = addrHistory.filter((a) => a.toLowerCase() !== contractAddr.toLowerCase());
 
   const tableEl = (
-    <PositionsTable positions={positions} txByAccount={txByAccount} checkingAddr={checkingAddr} onCheck={(p) => void runCheck(p)} priceOf={priceOf} />
+    <PositionsTable
+      positions={positions}
+      txByAccount={txByAccount}
+      checkingAddr={checkingAddr}
+      onCheck={(p) => void runCheck(p)}
+      priceOf={priceOf}
+      threshold={liveThreshold}
+    />
   );
 
   return (
@@ -1165,13 +1324,21 @@ export default function Page() {
               </span>
             )}
             <span className="hidden rounded-full border border-[#1b2b47] bg-[#0d1526] px-3 py-1.5 text-[11px] text-slate-400 sm:inline">
-              LIQ threshold <span className="font-semibold text-slate-200">{asNum(protocol?.threshold) || THRESHOLD}%</span>
+              LIQ threshold <span className="font-semibold text-slate-200">{liveThreshold}%</span>
             </span>
             {wallet ? (
-              <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-1.5 text-xs font-medium text-emerald-400">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                <span className="font-mono">{short(wallet)}</span>
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-1.5 text-xs font-medium text-emerald-400">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                  <span className="font-mono">{short(wallet)}</span>
+                </span>
+                <button
+                  className="rounded-full border border-[#1e293b] px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200"
+                  onClick={disconnectWallet}
+                >
+                  Disconnect
+                </button>
+              </div>
             ) : (
               <button
                 className="rounded-full bg-gradient-to-r from-cyan-500 to-blue-600 px-4 py-1.5 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
@@ -1196,7 +1363,7 @@ export default function Page() {
               <div className="flex items-center gap-3 text-sm text-rose-300">
                 <span className="h-2 w-2 animate-ping rounded-full bg-rose-400" />
                 <span className="font-semibold">Circuit breaker active</span>
-                <span className="text-rose-300/70">— a collateral ratio breached the threshold; all checks revert until resumed.</span>
+                <span className="text-rose-300/70">— a collateral ratio breached {liveThreshold}%; all checks revert until resumed.</span>
               </div>
               <button
                 className="rounded-lg border border-rose-500/40 px-3 py-1.5 text-xs font-semibold text-rose-300 hover:bg-rose-500/10 disabled:opacity-50"
@@ -1231,7 +1398,7 @@ export default function Page() {
                 {[
                   { label: 'Total Collateral', value: fmtUSD(stats.coll), sub: 'across monitored accounts', accent: 'text-cyan-300' },
                   { label: 'Total Debt', value: fmtUSD(stats.debt), sub: 'USDT denominated', accent: 'text-rose-300' },
-                  { label: 'Portfolio Health', value: `${stats.health}%`, sub: `threshold ${THRESHOLD}%`, accent: healthColor },
+                  { label: 'Portfolio Health', value: `${stats.health}%`, sub: `threshold ${liveThreshold}%`, accent: healthColor },
                   { label: 'Consensus Checks', value: String(asNum(protocol?.total_checks)), sub: paused ? 'protocol paused' : 'protocol operational', accent: 'text-slate-100' },
                 ].map((c) => (
                   <div key={c.label} className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-4">
@@ -1284,17 +1451,21 @@ export default function Page() {
                         <span className="text-slate-300">Debt</span>
                       </div>
                       <div className="pt-2 text-[11px] text-slate-600">
-                        Health = collateral ÷ debt. Below {THRESHOLD}% the engine trips the breaker.
+                        Health = collateral ÷ debt. Below {liveThreshold}% the engine trips the breaker.
                       </div>
                     </div>
                   </div>
                 </div>
 
                 <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
-                  <div className="mb-1 text-sm font-medium text-slate-300">Portfolio Health — 27h</div>
-                  <div className="text-[11px] text-slate-600">simulated timeline · live verdicts mark the current point</div>
+                  <div className="mb-1 text-sm font-medium text-slate-300">Check History</div>
+                  <div className="text-[11px] text-slate-600">
+                    {history.length >= 2
+                      ? `real on-chain ratios · last ${history.length} checks`
+                      : 'simulated — run 2+ checks to build the real history'}
+                  </div>
                   <div className="mt-2 h-[200px]">
-                    <HealthTimeline positions={positions} threshold={THRESHOLD} prices={livePrices ?? DISPLAY_PRICES} />
+                    <HealthTimeline positions={positions} threshold={liveThreshold} prices={livePrices ?? DISPLAY_PRICES} history={history} />
                   </div>
                 </div>
               </div>
@@ -1320,7 +1491,7 @@ export default function Page() {
                   </div>
                   {tableEl}
                 </div>
-                <Terminal logs={logs} termRef={termRef} />
+                <ActivityPanel logs={logs} termRef={termRef} onClear={() => setLogs([])} />
               </div>
             </>
           )}
@@ -1355,7 +1526,7 @@ export default function Page() {
                 <dl className="space-y-3 text-xs">
                   {[
                     ['Circuit breaker', paused ? 'ENGAGED — protocol paused' : 'disengaged — operational'],
-                    ['Safety threshold', `${asNum(protocol?.threshold) || THRESHOLD}%`],
+                    ['Safety threshold', `${liveThreshold}%`],
                     ['Consensus checks run', String(asNum(protocol?.total_checks))],
                     ['Owner (can resume)', protocol?.owner ? short(protocol.owner) : '—'],
                     ['Contract', short(contractAddr)],
@@ -1366,22 +1537,32 @@ export default function Page() {
                     </div>
                   ))}
                 </dl>
-                <button
-                  className="mt-4 w-full rounded-lg border border-rose-500/40 px-3 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-500/10 disabled:opacity-50"
-                  onClick={() => void resumeProtocol()}
-                  disabled={resuming || !paused}
-                >
-                  {resuming ? 'Resuming…' : paused ? 'Resume Protocol (owner only)' : 'Protocol operational — nothing to resume'}
-                </button>
+                <div className="mt-4 space-y-3">
+                  <button
+                    className="w-full rounded-lg border border-rose-500/40 px-3 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-500/10 disabled:opacity-50"
+                    onClick={() => void resumeProtocol()}
+                    disabled={resuming || !paused}
+                  >
+                    {resuming ? 'Working…' : paused ? 'Resume Protocol (owner only)' : 'Protocol operational — nothing to resume'}
+                  </button>
+                  <div className="rounded-lg border border-[#1e293b] p-3">
+                    <div className="mb-2 text-[10px] uppercase tracking-widest text-slate-500">Liquidation threshold (owner only)</div>
+                    <ThresholdControl
+                      current={liveThreshold}
+                      busy={resuming}
+                      onSubmit={(v) => void updateThreshold(v)}
+                    />
+                  </div>
+                </div>
               </div>
               <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5 text-xs leading-relaxed text-slate-400">
                 <div className="mb-3 text-sm font-medium text-slate-300">How a Check() works</div>
                 <ol className="list-decimal space-y-2 pl-4">
                   <li>Your Run Check() broadcasts <span className="font-mono text-cyan-300">check_and_protect</span> through MetaMask to the consensus contract.</li>
-                  <li>Five independent LLM validators each fetch the live asset price from Binance and recompute the collateral ratio.</li>
+                  <li>Five independent LLM validators each fetch the live asset price (Binance → Coinbase → CoinGecko fallback chain) and recompute the collateral ratio.</li>
                   <li>The equivalence principle requires them to agree on the verdict category (SAFE / WARNING / CRITICAL) — numeric drift from live prices is tolerated.</li>
-                  <li>SAFE holds, WARNING flags catastrophic AI sentiment, and a ratio below {THRESHOLD}% trips the circuit breaker and pauses the protocol.</li>
-                  <li>If the price feed is unreachable, validators use a fallback price and the verdict is flagged <span className="font-mono">[price feed unavailable — used fallback price]</span>.</li>
+                  <li>SAFE holds, WARNING flags catastrophic AI sentiment, and a ratio below {liveThreshold}% trips the circuit breaker and pauses the protocol.</li>
+                  <li>Every check is recorded on-chain — the Dashboard timeline plots the real ratios from <span className="font-mono text-cyan-300">get_check_history</span>.</li>
                 </ol>
               </div>
             </div>
@@ -1392,12 +1573,17 @@ export default function Page() {
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <div className="text-sm font-medium text-slate-300">Transaction Activity</div>
-                  <div className="text-[11px] text-slate-600">Live on-chain outcomes — status, execution result, validator consensus and decoded output</div>
+                  <div className="text-[11px] text-slate-600">
+                    Live on-chain outcomes — status, execution result, validator consensus and decoded output. Saved in this browser.
+                  </div>
                 </div>
                 <button
                   className="rounded-lg border border-[#1e293b] px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200"
                   onClick={() => txs.forEach((t) => {
-                    if (t.state === 'IN_FLIGHT') void trackTx(t.hash, 1, 1);
+                    if (t.state === 'IN_FLIGHT' || t.state === 'STALE') {
+                      updateTx(t.hash, { state: 'IN_FLIGHT' });
+                      void trackTx(t.hash);
+                    }
                   })}
                 >
                   Re-poll pending
@@ -1423,7 +1609,7 @@ export default function Page() {
                 <div className="mb-1 text-sm font-medium text-slate-300">Contract Address</div>
                 <p className="mb-3 text-[11px] text-slate-500">
                   Deployed CollateralGuard on {NETWORK_LABEL}. Keep the address exactly as the explorer shows it (checksummed) —
-                  the node&apos;s lookup is case-sensitive. Saved in this browser.
+                  the node&apos;s lookup is case-sensitive. Positions and history are per-contract: switching addresses switches data.
                 </p>
                 <div className="flex gap-2">
                   <input
@@ -1434,11 +1620,27 @@ export default function Page() {
                   />
                   <button
                     className="shrink-0 rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 px-4 py-2 text-xs font-semibold text-white hover:opacity-90"
-                    onClick={() => saveAddress()}
+                    onClick={() => switchAddress(addrInput)}
                   >
                     Save & Sync
                   </button>
                 </div>
+                {otherAddresses.length > 0 && (
+                  <div className="mt-3 border-t border-[#0e1526] pt-3">
+                    <div className="mb-1.5 text-[10px] uppercase tracking-widest text-slate-600">Recent contracts</div>
+                    <div className="flex flex-wrap gap-2">
+                      {otherAddresses.map((a) => (
+                        <button
+                          key={a}
+                          className="rounded-lg border border-[#1e293b] px-2.5 py-1 font-mono text-[10px] text-slate-400 hover:border-cyan-500/40 hover:text-cyan-300"
+                          onClick={() => switchAddress(a)}
+                        >
+                          {short(a)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5 text-xs text-slate-400">
@@ -1475,6 +1677,38 @@ export default function Page() {
           onSubmit={(f) => void submitAddFunds(f)}
         />
       )}
+    </div>
+  );
+}
+
+function ThresholdControl({
+  current, busy, onSubmit,
+}: {
+  current: number;
+  busy: boolean;
+  onSubmit: (v: number) => void;
+}) {
+  const [value, setValue] = useState(String(current));
+  useEffect(() => setValue(String(current)), [current]);
+  const parsed = Math.round(Number(value));
+  const valid = Number.isFinite(parsed) && parsed >= 1 && parsed <= 1000 && parsed !== current;
+  return (
+    <div className="flex gap-2">
+      <input
+        className="w-24 rounded-lg border border-[#1e293b] bg-[#070b14] px-3 py-2 font-mono text-xs text-slate-200 outline-none focus:border-cyan-400/60"
+        type="number"
+        min="1"
+        max="1000"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+      />
+      <button
+        className="flex-1 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-40"
+        onClick={() => valid && onSubmit(parsed)}
+        disabled={busy || !valid}
+      >
+        {busy ? 'Broadcasting…' : 'Update Threshold'}
+      </button>
     </div>
   );
 }
