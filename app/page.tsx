@@ -394,14 +394,10 @@ export default function Page() {
   const [wallet, setWallet] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [positions, setPositions] = useState<Position[]>(SEED_POSITIONS);
-  const [logs, setLogs] = useState<LogEntry[]>([
-    {
-      id: 0,
-      time: new Date().toLocaleTimeString('en-GB'),
-      level: 'info',
-      msg: 'CollateralGuard risk engine online — GenLayer Intelligent Consensus ready',
-    },
-  ]);
+  // Empty at first render: a pre-computed timestamp here differs between the
+  // server prerender and the client hydration pass and trips React's
+  // hydration check (console errors on every load). Boot logs go in an effect.
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [adding, setAdding] = useState(false);
   const [checkingAddr, setCheckingAddr] = useState<string | null>(null);
@@ -424,6 +420,13 @@ export default function Page() {
     const el = termRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [logs]);
+
+  // Client-only boot logs (never rendered on the server).
+  useEffect(() => {
+    pushLog('info', 'CollateralGuard risk engine online — GenLayer Intelligent Consensus ready');
+    pushLog('info', `Target contract: ${short(CONTRACT_ADDRESS)} on ${NETWORK_LABEL} (61999)`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /* ── GenVM reads/writes through the official SDK ── */
 
@@ -451,19 +454,28 @@ export default function Page() {
       });
       pushLog('info', `Tx broadcast: ${short(txHash)} — waiting for GenVM consensus…`, txHash);
 
-      // ACCEPTED = validators agreed on the execution; FINALIZED comes later.
+      // ACCEPTED = validators agreed on the execution; AI consensus can take
+      // a while, so wait patiently (≈3 min) before falling back to polling.
       let receipt: any = null;
       try {
         receipt = await getReadClient().waitForTransactionReceipt({
           hash: txHash,
           status: TransactionStatus.ACCEPTED,
+          interval: 2000,
+          retries: 90,
         });
-      } catch {
-        pushLog('warn', 'Consensus still settling — continuing to watch contract state');
+      } catch (e: any) {
+        pushLog('warn', `Still waiting for consensus (${e?.message ?? 'receipt timeout'}) — watching contract state instead`);
       }
       if (receipt && receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
-        pushLog('error', `Contract execution failed on-chain (state was reverted)`, txHash);
-        throw new Error('execution reverted');
+        const detail =
+          receipt.stderr ||
+          receipt.errorMessage ||
+          receipt.error_message ||
+          receipt.resultName ||
+          'unknown revert';
+        pushLog('error', `Contract execution reverted on-chain: ${detail}`, txHash);
+        throw new Error(`execution reverted: ${detail}`);
       }
       if (receipt && receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_RETURN) {
         pushLog('success', 'Consensus ACCEPTED — validators finalized the execution', txHash);
