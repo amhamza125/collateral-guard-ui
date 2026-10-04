@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { ethers } from "ethers";
 
-const CONTRACT_ADDRESS = "0xD914f1eC67f29B0eA078A0A8d32b3c0461504754";
+const CONTRACT_ADDRESS = "0xC4Be515B4fab18f2D87D8BE0BF28d1f1Ef15cc4B";
 
 const CONTRACT_ABI = [
   "function add_monitored_account(string account_address, uint256 collateral_amount, uint256 debt_amount, string collateral_asset, string debt_asset)",
