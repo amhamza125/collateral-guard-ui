@@ -4,18 +4,18 @@
  * CollateralGuard — DeFi Risk Engine ("Cryzen" design language)
  * ─────────────────────────────────────────────────────────────────────────────
  * SETUP
- *   1. npm install genlayer-js   (the official SDK — no ethers, no hand-rolled
- *      calldata encoding; the SDK handles GenVM calldata/RLP + receipts natively)
- *   2. Contract is preconfigured to the deployed CollateralGuard on Studionet
- *      (chain ID 61999). To point at a different deployment, set
- *      NEXT_PUBLIC_GUARD_ADDRESS in .env.local and restart the dev server.
- *   3. Deploy to Vercel as usual — all chain calls run client-side.
+ *   1. npm install genlayer-js   (official SDK — handles GenVM calldata + receipts)
+ *   2. The deployed CollateralGuard address is preconfigured below. You can
+ *      also override it at runtime in the Settings tab (saved to localStorage)
+ *      or at build time via NEXT_PUBLIC_GUARD_ADDRESS.
+ *   3. IMPORTANT: keep the address CHECKSUMMED exactly as the explorer shows
+ *      it. The hosted Studio node performs a case-sensitive contract lookup —
+ *      a lowercased address makes every read fail with "Contract not found".
  *
- * WHY THE SDK (hard-won): calling GenLayer through raw ethers v6 crashes on
- * tx.wait() (GenVM receipts are not EVM receipts → BAD_DATA), and GenVM
- * calldata is not Solidity ABI. genlayer-js handles both, exposes
- * waitForTransactionReceipt with real GenLayer tx statuses, and its
- * readContract/writeContract take plain functionName + args.
+ * VERIFIED AGAINST genlayer-js@1.1.8 + hosted Studionet (studio.genlayer.com/api, 61999):
+ *   • writeContract → MetaMask → consensus contract; returns the GenLayer tx id.
+ *   • readContract returns decoded values; works only with the checksummed address.
+ *   • waitForTransactionReceipt + txExecutionResultName for accept/error detection.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -31,23 +31,23 @@ declare global {
 
 /* ─────────────────────────────── CONFIG ─────────────────────────────── */
 
-// Deployed CollateralGuard on GenLayer Studionet (chain ID 61999).
-const CONTRACT_ADDRESS = (
-  process.env.NEXT_PUBLIC_GUARD_ADDRESS ?? '0xaCBd7A2861E5f41276F17ffCF0881906798988C4'
-).toLowerCase() as `0x${string}`;
+// Deployed CollateralGuard on GenLayer Studionet (chain 61999) — CHECKSUMMED.
+// Do not lowercase this: the node's contract lookup is case-sensitive.
+const DEFAULT_CONTRACT_ADDRESS = '0xaCBd7A2861E5f41276F17ffCF0881906798988C4';
+const ADDRESS_STORAGE_KEY = 'cg_contract_address';
 
 const NETWORK_LABEL = 'GenLayer Studionet';
 const EXPLORER_TX = 'https://explorer-studio.genlayer.com/tx/';
 const THRESHOLD = 150;
 
-// Display-only spot prices for the dashboard charts. The contract itself
-// fetches the live price from Binance inside the consensus flow during check().
-const DISPLAY_PRICES: Record<string, number> = { ETH: 3200, BTC: 64000, SOL: 150 };
-const ASSET_COLORS: Record<string, string> = { ETH: '#627eea', BTC: '#f7931a', SOL: '#14f195' };
+// Display-only spot prices for the dashboard charts. The contract fetches the
+// live price from Binance inside the consensus flow (and flags FALLBACK in the
+// verdict message when the feed is unreachable).
+const DISPLAY_PRICES: Record<string, number> = { ETH: 3200, BTC: 64000, SOL: 150, WETH: 3200 };
+const ASSET_COLORS: Record<string, string> = { ETH: '#627eea', WETH: '#627eea', BTC: '#f7931a', SOL: '#14f195' };
 
 type GenClient = ReturnType<typeof createClient>;
 
-// Read client talks straight to the GenLayer RPC — no wallet needed.
 let readClientSingleton: GenClient | null = null;
 function getReadClient(): GenClient {
   if (!readClientSingleton) readClientSingleton = createClient({ chain: studionet });
@@ -65,10 +65,16 @@ type Position = {
   status: 'SAFE' | 'WARNING' | 'CRITICAL';
   last_ratio: number;
   ai_sentiment?: string;
-  price_source?: string;
   last_message: string;
   last_checked: string;
   localOnly?: boolean;
+};
+
+type ProtocolState = {
+  paused: boolean;
+  threshold: string | number;
+  owner: string;
+  total_checks: string | number;
 };
 
 type LogLevel = 'info' | 'success' | 'warn' | 'error' | 'ai';
@@ -83,29 +89,32 @@ type LogEntry = {
 
 const short = (a: string) => (a.length > 13 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a);
 const fmtUSD = (n: number) => `$${Math.round(n).toLocaleString('en-US')}`;
+const asNum = (v: string | number | undefined) => (typeof v === 'number' ? v : Number(v ?? 0) || 0);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Local preview rows so the dashboard is never empty before the chain is
+// synced. Run Check on a preview row auto-adds it on-chain first.
 const SEED_POSITIONS: Position[] = [
   {
     address: '0x9ab41c7d5f3a92e0b6d18c4a77e2f9d0c5b8a3e1',
     collateral_amount: 40, debt_amount: 60000, collateral_asset: 'ETH', debt_asset: 'USDT',
-    status: 'SAFE', last_ratio: 213, ai_sentiment: 'NEUTRAL', price_source: 'LIVE',
-    last_message: 'RATIO_SAFE_CONDITION_HELD: ratio 213% is healthy — AI sentiment is NEUTRAL',
-    last_checked: 'CHECK #12', localOnly: true,
+    status: 'SAFE', last_ratio: 213, ai_sentiment: 'NEUTRAL',
+    last_message: 'Preview row — press Run Check() to add it on-chain and run the engine',
+    last_checked: 'PREVIEW', localOnly: true,
   },
   {
     address: '0x1c7d9f02e5a4b8306d91c7f5a2e8b4d0f3a6c9e2',
     collateral_amount: 10, debt_amount: 400000, collateral_asset: 'BTC', debt_asset: 'USDT',
-    status: 'WARNING', last_ratio: 160, ai_sentiment: 'CATASTROPHIC', price_source: 'LIVE',
-    last_message: 'AI_CONSENSUS_WARNING: ratio 160% held, but AI consensus detected catastrophic market sentiment',
-    last_checked: 'CHECK #13', localOnly: true,
+    status: 'WARNING', last_ratio: 160, ai_sentiment: 'CATASTROPHIC',
+    last_message: 'Preview row — press Run Check() to add it on-chain and run the engine',
+    last_checked: 'PREVIEW', localOnly: true,
   },
   {
     address: '0xf3a902b7c4d1e6f8a5b3c2d9e7f4a1b6c8d0e3f5',
     collateral_amount: 300, debt_amount: 70000, collateral_asset: 'SOL', debt_asset: 'USDT',
-    status: 'CRITICAL', last_ratio: 64, ai_sentiment: 'NEUTRAL', price_source: 'FALLBACK',
-    last_message: 'CRITICAL_BREACH: ratio 64% < 150% — CIRCUIT_BREAKER_ENGAGED, protocol paused',
-    last_checked: 'CHECK #14', localOnly: true,
+    status: 'CRITICAL', last_ratio: 64, ai_sentiment: 'NEUTRAL',
+    last_message: 'Preview row — press Run Check() to add it on-chain and run the engine',
+    last_checked: 'PREVIEW', localOnly: true,
   },
 ];
 
@@ -114,6 +123,8 @@ const STATUS_STYLES: Record<Position['status'], string> = {
   WARNING: 'bg-amber-500/10 text-amber-300 border-amber-500/30',
   CRITICAL: 'bg-rose-500/10 text-rose-400 border-rose-500/30 animate-pulse',
 };
+
+type Tab = 'dashboard' | 'accounts' | 'risk' | 'history' | 'settings';
 
 /* ─────────────────────────── SVG components ─────────────────────────── */
 
@@ -162,7 +173,6 @@ function HealthTimeline({ positions, threshold }: { positions: Position[]; thres
     const coll = positions.reduce((s, p) => s + p.collateral_amount * (DISPLAY_PRICES[p.collateral_asset] ?? 1000), 0);
     const debt = Math.max(1, positions.reduce((s, p) => s + p.debt_amount, 0));
     const current = Math.min(340, Math.max(90, Math.round((coll * 100) / debt)));
-    // deterministic pseudo-random walk — same picture on every render
     let seed = 42 + positions.length * 7 + current * 13;
     const rand = () => {
       seed = (seed * 1103515245 + 12345) % 2147483648;
@@ -230,13 +240,13 @@ function StatusBadge({ status }: { status: Position['status'] }) {
   );
 }
 
-function Sidebar({ wallet }: { wallet: string | null }) {
-  const nav = [
-    { label: 'Dashboard', active: true, d: 'M3 12l9-8 9 8M5 10v10h14V10' },
-    { label: 'Accounts', active: false, d: 'M4 6h16M4 12h16M4 18h10' },
-    { label: 'Risk Engine', active: false, d: 'M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z' },
-    { label: 'History', active: false, d: 'M12 8v5l3 3M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
-    { label: 'Settings', active: false, d: 'M12 15a3 3 0 100-6 3 3 0 000 6zM19 12a7 7 0 01-.1 1.2l2 1.6-2 3.4-2.4-1a7 7 0 01-2 1.2L14 21h-4l-.5-2.6a7 7 0 01-2-1.2l-2.4 1-2-3.4 2-1.6A7 7 0 015 12' },
+function Sidebar({ wallet, tab, onTab }: { wallet: string | null; tab: Tab; onTab: (t: Tab) => void }) {
+  const nav: { id: Tab; label: string; d: string }[] = [
+    { id: 'dashboard', label: 'Dashboard', d: 'M3 12l9-8 9 8M5 10v10h14V10' },
+    { id: 'accounts', label: 'Accounts', d: 'M4 6h16M4 12h16M4 18h10' },
+    { id: 'risk', label: 'Risk Engine', d: 'M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z' },
+    { id: 'history', label: 'History', d: 'M12 8v5l3 3M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
+    { id: 'settings', label: 'Settings', d: 'M12 15a3 3 0 100-6 3 3 0 000 6zM19 12a7 7 0 01-.1 1.2l2 1.6-2 3.4-2.4-1a7 7 0 01-2 1.2L14 21h-4l-.5-2.6a7 7 0 01-2-1.2l-2.4 1-2-3.4 2-1.6A7 7 0 015 12' },
   ];
   return (
     <aside className="hidden w-64 shrink-0 flex-col border-r border-[#131c30] bg-[#090e1a] md:flex">
@@ -254,19 +264,20 @@ function Sidebar({ wallet }: { wallet: string | null }) {
 
       <nav className="mt-2 flex-1 space-y-1 px-3">
         {nav.map((n) => (
-          <div
-            key={n.label}
-            className={`flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm ${
-              n.active
+          <button
+            key={n.id}
+            onClick={() => onTab(n.id)}
+            className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm transition-colors ${
+              tab === n.id
                 ? 'border border-[#1b2b47] bg-[#0d1526] text-cyan-300'
-                : 'text-slate-500 hover:bg-[#0d1526] hover:text-slate-300'
+                : 'border border-transparent text-slate-500 hover:bg-[#0d1526] hover:text-slate-300'
             }`}
           >
             <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
               <path d={n.d} />
             </svg>
             {n.label}
-          </div>
+          </button>
         ))}
       </nav>
 
@@ -308,6 +319,7 @@ function Terminal({ logs, termRef }: { logs: LogEntry[]; termRef: React.RefObjec
         </span>
       </div>
       <div ref={termRef} className="flex-1 space-y-1.5 overflow-y-auto px-4 py-3 font-mono text-[11px] leading-relaxed">
+        {logs.length === 0 && <div className="text-slate-600">Booting…</div>}
         {logs.map((l) => (
           <div key={l.id} className="flex flex-wrap gap-x-2">
             <span className="text-slate-600">[{l.time}]</span>
@@ -358,6 +370,7 @@ function AddFundsModal({
             <label className="mb-1.5 block text-xs font-medium text-slate-400">Collateral asset</label>
             <select className={field} value={form.asset} onChange={(e) => set('asset', e.target.value)}>
               <option>ETH</option>
+              <option>WETH</option>
               <option>BTC</option>
               <option>SOL</option>
             </select>
@@ -388,26 +401,120 @@ function AddFundsModal({
   );
 }
 
+function PositionsTable({
+  positions, txByAccount, checkingAddr, onCheck,
+}: {
+  positions: Position[];
+  txByAccount: Record<string, string>;
+  checkingAddr: string | null;
+  onCheck: (p: Position) => void;
+}) {
+  return (
+    <div className="overflow-hidden rounded-2xl border border-[#131c30] bg-[#0b1120]">
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-xs">
+          <thead>
+            <tr className="border-b border-[#131c30] text-[10px] uppercase tracking-widest text-slate-600">
+              <th className="px-5 py-3 font-medium">Account</th>
+              <th className="px-3 py-3 font-medium">Collateral</th>
+              <th className="px-3 py-3 font-medium">Debt</th>
+              <th className="px-3 py-3 font-medium">Ratio</th>
+              <th className="px-3 py-3 font-medium">Status</th>
+              <th className="px-5 py-3 text-right font-medium">Engine</th>
+            </tr>
+          </thead>
+          <tbody>
+            {positions.map((p) => (
+              <tr key={p.address} className="border-b border-[#0e1526] last:border-0 hover:bg-[#0d1526]/60">
+                <td className="px-5 py-3.5">
+                  <div className="font-mono text-slate-200">{short(p.address)}</div>
+                  <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-slate-600">
+                    {p.localOnly ? (
+                      <span className="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-amber-300">preview</span>
+                    ) : (
+                      <span>on-chain</span>
+                    )}
+                    {txByAccount[p.address] && (
+                      <a
+                        href={`${EXPLORER_TX}${txByAccount[p.address]}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-cyan-500 underline decoration-dotted hover:text-cyan-400"
+                      >
+                        tx ↗
+                      </a>
+                    )}
+                  </div>
+                </td>
+                <td className="px-3 py-3.5">
+                  <span className="font-semibold text-slate-200">{p.collateral_amount}</span>{' '}
+                  <span className="text-slate-500">{p.collateral_asset}</span>
+                  <div className="text-[10px] text-slate-600">
+                    {fmtUSD(p.collateral_amount * (DISPLAY_PRICES[p.collateral_asset] ?? 1000))}
+                  </div>
+                </td>
+                <td className="px-3 py-3.5 text-slate-400">{fmtUSD(p.debt_amount)}</td>
+                <td className="px-3 py-3.5">
+                  <div className={`font-semibold ${p.last_ratio >= THRESHOLD ? 'text-emerald-400' : p.last_ratio > 0 ? 'text-rose-400' : 'text-slate-500'}`}>
+                    {p.last_ratio > 0 ? `${p.last_ratio}%` : '—'}
+                  </div>
+                  <div className="relative mt-1 h-1.5 w-20 rounded bg-[#141d33]">
+                    <div
+                      className={`h-1.5 rounded ${p.last_ratio >= THRESHOLD ? 'bg-emerald-400' : 'bg-rose-400'}`}
+                      style={{ width: `${Math.min(100, (p.last_ratio / 300) * 100)}%` }}
+                    />
+                    <div className="absolute -top-1 h-3.5 w-px bg-rose-400/60" style={{ left: `${(THRESHOLD / 300) * 100}%` }} />
+                  </div>
+                </td>
+                <td className="px-3 py-3.5">
+                  <StatusBadge status={p.status} />
+                  <div className="mt-1 max-w-[220px] truncate text-[10px] text-slate-600" title={p.last_message}>
+                    {p.last_message}
+                  </div>
+                </td>
+                <td className="px-5 py-3.5 text-right">
+                  <button
+                    className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-40"
+                    onClick={() => onCheck(p)}
+                    disabled={checkingAddr !== null}
+                  >
+                    {checkingAddr === p.address ? 'Validators…' : 'Run Check()'}
+                  </button>
+                  <div className="mt-1 text-[10px] text-slate-600">{p.last_checked}</div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 /* ─────────────────────────────── PAGE ───────────────────────────────── */
 
 export default function Page() {
+  const [tab, setTab] = useState<Tab>('dashboard');
   const [wallet, setWallet] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [positions, setPositions] = useState<Position[]>(SEED_POSITIONS);
   // Empty at first render: a pre-computed timestamp here differs between the
-  // server prerender and the client hydration pass and trips React's
-  // hydration check (console errors on every load). Boot logs go in an effect.
+  // server prerender and client hydration and trips React's hydration check.
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [adding, setAdding] = useState(false);
   const [checkingAddr, setCheckingAddr] = useState<string | null>(null);
   const [resuming, setResuming] = useState(false);
-  const [paused, setPaused] = useState(false);
+  const [protocol, setProtocol] = useState<ProtocolState | null>(null);
   const [txByAccount, setTxByAccount] = useState<Record<string, string>>({});
+  const [contractAddr, setContractAddr] = useState(DEFAULT_CONTRACT_ADDRESS);
+  const [addrInput, setAddrInput] = useState(DEFAULT_CONTRACT_ADDRESS);
 
   const writeClientRef = useRef<GenClient | null>(null);
   const logIdRef = useRef(1);
   const termRef = useRef<HTMLDivElement | null>(null);
+
+  const paused = protocol?.paused === true;
 
   const pushLog = useCallback((level: LogLevel, msg: string, txHash?: string) => {
     setLogs((prev) => [
@@ -421,41 +528,84 @@ export default function Page() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [logs]);
 
-  // Client-only boot logs (never rendered on the server).
+  // Restore a runtime address override (Settings tab) after mount, and log
+  // boot lines client-side only.
   useEffect(() => {
+    const saved = window.localStorage.getItem(ADDRESS_STORAGE_KEY);
+    if (saved && /^0x[0-9a-fA-F]{40}$/.test(saved)) {
+      setContractAddr(saved);
+      setAddrInput(saved);
+    }
     pushLog('info', 'CollateralGuard risk engine online — GenLayer Intelligent Consensus ready');
-    pushLog('info', `Target contract: ${short(CONTRACT_ADDRESS)} on ${NETWORK_LABEL} (61999)`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    pushLog('info', `Target contract: ${short(contractAddr)} on ${NETWORK_LABEL} (61999)`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contractAddr]);
 
   /* ── GenVM reads/writes through the official SDK ── */
 
   const callView = useCallback(
     async (method: string, args: unknown[] = []): Promise<unknown> => {
-      // SDK handles GenVM calldata encoding + decoding; a str return arrives as a JS string.
       return await getReadClient().readContract({
-        address: CONTRACT_ADDRESS,
+        address: contractAddr as `0x${string}`,
         functionName: method,
         args: args as any,
       });
     },
-    [],
+    [contractAddr],
   );
+
+  const refreshProtocolState = useCallback(async () => {
+    try {
+      const ps = await callView('get_protocol_state', []);
+      const st = typeof ps === 'string' ? JSON.parse(ps) : ps;
+      if (st && typeof st === 'object') setProtocol(st as ProtocolState);
+      return st as ProtocolState | null;
+    } catch {
+      return null;
+    }
+  }, [callView]);
+
+  const syncFromChain = useCallback(async () => {
+    try {
+      const raw = await callView('get_all_accounts', []);
+      const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (Array.isArray(list) && list.length > 0) {
+        setPositions(list.map((r: any) => ({ ...r, address: r.address, localOnly: false }) as Position));
+        pushLog('success', `Synced ${list.length} monitored account(s) from GenVM state`);
+      } else if (Array.isArray(list)) {
+        pushLog('info', 'Contract is live on-chain with no monitored accounts yet — add one to begin');
+      }
+      await refreshProtocolState();
+    } catch (e: any) {
+      // Reads fail loudly: the two known causes are a wrong address and a
+      // case-mangled address (this node's lookup is case-sensitive).
+      const msg = String(e?.message ?? e);
+      if (/not found/i.test(msg)) {
+        pushLog('error', `Contract ${short(contractAddr)} not found on ${NETWORK_LABEL} — check the address (Settings) and keep it exactly checksummed`);
+      } else {
+        pushLog('error', `Chain read failed: ${msg.slice(0, 160)}`);
+      }
+    }
+  }, [callView, pushLog, refreshProtocolState, contractAddr]);
 
   const sendWrite = useCallback(
     async (method: string, args: unknown[]): Promise<string> => {
       const client = writeClientRef.current;
       if (!client) throw new Error('wallet not connected');
       const txHash = await client.writeContract({
-        address: CONTRACT_ADDRESS,
+        address: contractAddr as `0x${string}`,
         functionName: method,
         args: args as any,
         value: BigInt(0),
       });
       pushLog('info', `Tx broadcast: ${short(txHash)} — waiting for GenVM consensus…`, txHash);
 
-      // ACCEPTED = validators agreed on the execution; AI consensus can take
-      // a while, so wait patiently (≈3 min) before falling back to polling.
+      // ACCEPTED = validators agreed; AI consensus can take a while, so wait
+      // patiently (≈3 min) before falling back to polling.
       let receipt: any = null;
       try {
         receipt = await getReadClient().waitForTransactionReceipt({
@@ -467,22 +617,19 @@ export default function Page() {
       } catch (e: any) {
         pushLog('warn', `Still waiting for consensus (${e?.message ?? 'receipt timeout'}) — watching contract state instead`);
       }
-      if (receipt && receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
-        const detail =
-          receipt.stderr ||
-          receipt.errorMessage ||
-          receipt.error_message ||
-          receipt.resultName ||
-          'unknown revert';
+
+      const resultName: string | undefined = receipt?.txExecutionResultName ?? receipt?.resultName;
+      if (resultName === ExecutionResult.FINISHED_WITH_ERROR || resultName === 'UNDETERMINED') {
+        const detail = receipt?.stderr || receipt?.errorMessage || receipt?.error_message || resultName || 'unknown revert';
         pushLog('error', `Contract execution reverted on-chain: ${detail}`, txHash);
         throw new Error(`execution reverted: ${detail}`);
       }
-      if (receipt && receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_RETURN) {
-        pushLog('success', 'Consensus ACCEPTED — validators finalized the execution', txHash);
+      if (receipt) {
+        pushLog('success', `Consensus reached (${receipt.statusName ?? 'ACCEPTED'}) — validators finalized the execution`, txHash);
       }
       return txHash;
     },
-    [pushLog],
+    [contractAddr, pushLog],
   );
 
   const pollPosition = useCallback(
@@ -504,22 +651,6 @@ export default function Page() {
     },
     [callView, pushLog],
   );
-
-  const syncFromChain = useCallback(async () => {
-    try {
-      const raw = await callView('get_all_accounts', []);
-      const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      if (Array.isArray(list) && list.length > 0) {
-        setPositions(list.map((r: any) => ({ ...r, address: r.address, localOnly: false }) as Position));
-        pushLog('success', `Synced ${list.length} monitored account(s) from GenVM state`);
-      }
-      const ps = await callView('get_protocol_state', []);
-      const st = typeof ps === 'string' ? JSON.parse(ps) : ps;
-      if (st && typeof st === 'object') setPaused(Boolean((st as any).paused));
-    } catch {
-      /* silent — the demo continues on local state */
-    }
-  }, [callView, pushLog]);
 
   /* ── wallet ── */
 
@@ -545,7 +676,7 @@ export default function Page() {
         writeClientRef.current = client;
         setWallet(addr);
         pushLog('success', `Wallet connected: ${short(addr)} — ${NETWORK_LABEL} (61999)`);
-        void syncFromChain();
+        await syncFromChain();
       }
       return addr;
     } catch (e: any) {
@@ -597,18 +728,28 @@ export default function Page() {
         if (!w || !writeClientRef.current) return;
       }
       setCheckingAddr(pos.address);
-      pushLog('ai', `check_and_protect(${short(pos.address)}) → validators fetching ${pos.collateral_asset} price via Binance, then LLM consensus…`);
       try {
-        const hash = await sendWrite('check_and_protect', [pos.address]);
+        let target = pos;
+        if (pos.localOnly) {
+          pushLog('info', `${short(pos.address)} is a preview row — adding it on-chain first…`);
+          await sendWrite(
+            'add_monitored_account',
+            [pos.address, pos.collateral_amount, pos.debt_amount, pos.collateral_asset, pos.debt_asset],
+          );
+          target = { ...pos, localOnly: false };
+          upsert(target);
+        }
+        pushLog('ai', `check_and_protect(${short(target.address)}) → validators fetching ${target.collateral_asset} price via Binance, then LLM consensus…`);
+        const hash = await sendWrite('check_and_protect', [target.address]);
         pushLog('ai', 'Equivalence principle active — every validator must agree on the risk verdict…');
-        const fresh = await pollPosition(pos.address);
+        const fresh = await pollPosition(target.address);
         if (fresh) {
           upsert(fresh);
-          setTxByAccount((prev) => ({ ...prev, [pos.address]: hash }));
+          setTxByAccount((prev) => ({ ...prev, [target.address]: hash }));
           const level: LogLevel = fresh.status === 'CRITICAL' ? 'error' : fresh.status === 'WARNING' ? 'warn' : 'success';
           pushLog(level, fresh.last_message, hash);
+          await refreshProtocolState();
           if (fresh.status === 'CRITICAL') {
-            setPaused(true);
             pushLog('error', 'CIRCUIT BREAKER ENGAGED — every further check() will revert until the owner resumes the protocol');
           }
         } else {
@@ -620,7 +761,7 @@ export default function Page() {
         setCheckingAddr(null);
       }
     },
-    [wallet, connectWallet, pushLog, sendWrite, pollPosition, upsert],
+    [wallet, connectWallet, pushLog, sendWrite, pollPosition, upsert, refreshProtocolState],
   );
 
   const submitAddFunds = useCallback(
@@ -681,17 +822,14 @@ export default function Page() {
     pushLog('info', 'resume_protocol() — only the deployer can disengage the circuit breaker…');
     try {
       const hash = await sendWrite('resume_protocol', []);
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 8; i++) {
         await sleep(4000);
-        try {
-          const ps = await callView('get_protocol_state', []);
-          const st = typeof ps === 'string' ? JSON.parse(ps) : ps;
-          if (st && typeof st === 'object' && !(st as any).paused) {
-            setPaused(false);
-            pushLog('success', 'PROTOCOL_RESUMED: circuit breaker disengaged — checks are live again', hash);
-            return;
-          }
-        } catch { /* settling */ }
+        const st = await refreshProtocolState();
+        if (st && st.paused === false) {
+          setProtocol(st);
+          pushLog('success', 'PROTOCOL_RESUMED: circuit breaker disengaged — checks are live again', hash);
+          return;
+        }
       }
       pushLog('warn', 'Resume still settling in consensus — check again shortly');
     } catch (e: any) {
@@ -699,7 +837,19 @@ export default function Page() {
     } finally {
       setResuming(false);
     }
-  }, [pushLog, sendWrite, callView]);
+  }, [pushLog, sendWrite, refreshProtocolState]);
+
+  const saveAddress = useCallback(() => {
+    const v = addrInput.trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(v)) {
+      pushLog('error', 'That is not a valid 20-byte address (0x + 40 hex chars)');
+      return;
+    }
+    window.localStorage.setItem(ADDRESS_STORAGE_KEY, v);
+    setContractAddr(v);
+    pushLog('info', `Contract address updated to ${short(v)} — syncing…`);
+    void syncFromChain();
+  }, [addrInput, pushLog, syncFromChain]);
 
   /* ── derived dashboard data ── */
 
@@ -723,10 +873,16 @@ export default function Page() {
   }, [positions]);
 
   const healthColor = stats.health >= THRESHOLD ? 'text-emerald-400' : 'text-rose-400';
+  const unconfigured = contractAddr === '0x0000000000000000000000000000000000000000';
+  const txLog = logs.filter((l) => l.txHash);
+
+  const tableEl = (
+    <PositionsTable positions={positions} txByAccount={txByAccount} checkingAddr={checkingAddr} onCheck={(p) => void runCheck(p)} />
+  );
 
   return (
     <div className="flex min-h-screen bg-[#070b14] text-slate-200">
-      <Sidebar wallet={wallet} />
+      <Sidebar wallet={wallet} tab={tab} onTab={setTab} />
 
       <main className="min-w-0 flex-1">
         {/* header */}
@@ -739,7 +895,7 @@ export default function Page() {
           </div>
           <div className="flex items-center gap-3">
             <span className="hidden rounded-full border border-[#1b2b47] bg-[#0d1526] px-3 py-1.5 text-[11px] text-slate-400 sm:inline">
-              LIQ threshold <span className="font-semibold text-slate-200">{THRESHOLD}%</span>
+              LIQ threshold <span className="font-semibold text-slate-200">{asNum(protocol?.threshold) || THRESHOLD}%</span>
             </span>
             {wallet ? (
               <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-1.5 text-xs font-medium text-emerald-400">
@@ -759,12 +915,18 @@ export default function Page() {
         </header>
 
         <div className="space-y-6 px-6 py-6">
+          {unconfigured && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-xs text-amber-300">
+              Demo mode — no contract address configured. Deploy CollateralGuard.py and set the address in the Settings tab.
+            </div>
+          )}
+
           {paused && (
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3">
               <div className="flex items-center gap-3 text-sm text-rose-300">
                 <span className="h-2 w-2 animate-ping rounded-full bg-rose-400" />
                 <span className="font-semibold">Circuit breaker active</span>
-                <span className="text-rose-300/70">— collateral ratio breached {THRESHOLD}%; all checks revert until resumed.</span>
+                <span className="text-rose-300/70">— a collateral ratio breached the threshold; all checks revert until resumed.</span>
               </div>
               <button
                 className="rounded-lg border border-rose-500/40 px-3 py-1.5 text-xs font-semibold text-rose-300 hover:bg-rose-500/10 disabled:opacity-50"
@@ -776,178 +938,246 @@ export default function Page() {
             </div>
           )}
 
-          {/* stats */}
-          <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
-            {[
-              { label: 'Total Collateral', value: fmtUSD(stats.coll), sub: 'across monitored accounts', accent: 'text-cyan-300' },
-              { label: 'Total Debt', value: fmtUSD(stats.debt), sub: 'USDT denominated', accent: 'text-rose-300' },
-              { label: 'Portfolio Health', value: `${stats.health}%`, sub: `threshold ${THRESHOLD}%`, accent: healthColor },
-              { label: 'Monitored Accounts', value: String(positions.length), sub: paused ? 'protocol paused' : 'protocol operational', accent: 'text-slate-100' },
-            ].map((c) => (
-              <div key={c.label} className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-4">
-                <div className="text-[11px] uppercase tracking-widest text-slate-500">{c.label}</div>
-                <div className={`mt-1.5 text-2xl font-semibold ${c.accent}`}>{c.value}</div>
-                <div className="mt-1 text-[11px] text-slate-600">{c.sub}</div>
+          {tab === 'dashboard' && (
+            <>
+              {/* stats */}
+              <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
+                {[
+                  { label: 'Total Collateral', value: fmtUSD(stats.coll), sub: 'across monitored accounts', accent: 'text-cyan-300' },
+                  { label: 'Total Debt', value: fmtUSD(stats.debt), sub: 'USDT denominated', accent: 'text-rose-300' },
+                  { label: 'Portfolio Health', value: `${stats.health}%`, sub: `threshold ${THRESHOLD}%`, accent: healthColor },
+                  { label: 'Consensus Checks', value: String(asNum(protocol?.total_checks)), sub: paused ? 'protocol paused' : 'protocol operational', accent: 'text-slate-100' },
+                ].map((c) => (
+                  <div key={c.label} className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-4">
+                    <div className="text-[11px] uppercase tracking-widest text-slate-500">{c.label}</div>
+                    <div className={`mt-1.5 text-2xl font-semibold ${c.accent}`}>{c.value}</div>
+                    <div className="mt-1 text-[11px] text-slate-600">{c.sub}</div>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
 
-          {/* charts */}
-          <div className="grid gap-4 lg:grid-cols-3">
-            <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
-              <div className="mb-3 text-sm font-medium text-slate-300">Asset Allocation</div>
-              <div className="flex items-center gap-4">
-                <Donut
-                  segments={allocation.length ? allocation : [{ label: '—', value: 1, color: '#141d33' }]}
-                  centerLabel={fmtUSD(stats.coll)}
-                  centerSub="collateral"
-                />
-                <div className="space-y-2">
-                  {allocation.map((a) => (
-                    <div key={a.label} className="flex items-center gap-2 text-xs">
-                      <span className="h-2.5 w-2.5 rounded-sm" style={{ background: a.color }} />
-                      <span className="text-slate-300">{a.label}</span>
-                      <span className="text-slate-600">{fmtUSD(a.value)}</span>
+              {/* charts */}
+              <div className="grid gap-4 lg:grid-cols-3">
+                <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
+                  <div className="mb-3 text-sm font-medium text-slate-300">Asset Allocation</div>
+                  <div className="flex items-center gap-4">
+                    <Donut
+                      segments={allocation.length ? allocation : [{ label: '—', value: 1, color: '#141d33' }]}
+                      centerLabel={fmtUSD(stats.coll)}
+                      centerSub="collateral"
+                    />
+                    <div className="space-y-2">
+                      {allocation.map((a) => (
+                        <div key={a.label} className="flex items-center gap-2 text-xs">
+                          <span className="h-2.5 w-2.5 rounded-sm" style={{ background: a.color }} />
+                          <span className="text-slate-300">{a.label}</span>
+                          <span className="text-slate-600">{fmtUSD(a.value)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
+                  <div className="mb-3 text-sm font-medium text-slate-300">Collateral vs Debt</div>
+                  <div className="flex items-center gap-4">
+                    <Donut
+                      segments={[
+                        { label: 'Collateral', value: stats.coll, color: '#22d3ee' },
+                        { label: 'Debt', value: stats.debt, color: '#fb7185' },
+                      ]}
+                      centerLabel={`${stats.health}%`}
+                      centerSub="health"
+                    />
+                    <div className="space-y-2 text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className="h-2.5 w-2.5 rounded-sm bg-cyan-400" />
+                        <span className="text-slate-300">Collateral</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="h-2.5 w-2.5 rounded-sm bg-rose-400" />
+                        <span className="text-slate-300">Debt</span>
+                      </div>
+                      <div className="pt-2 text-[11px] text-slate-600">
+                        Health = collateral ÷ debt. Below {THRESHOLD}% the engine trips the breaker.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
+                  <div className="mb-1 text-sm font-medium text-slate-300">Portfolio Health — 27h</div>
+                  <div className="text-[11px] text-slate-600">simulated timeline · live verdicts mark the current point</div>
+                  <div className="mt-2 h-[200px]">
+                    <HealthTimeline positions={positions} threshold={THRESHOLD} />
+                  </div>
+                </div>
+              </div>
+
+              {/* table + terminal */}
+              <div className="grid gap-4 xl:grid-cols-3">
+                <div className="min-w-0 xl:col-span-2">
+                  <div className="mb-3 flex items-center justify-between">
+                    <div className="text-sm font-medium text-slate-300">Monitored Positions</div>
+                    <div className="flex gap-2">
+                      <button
+                        className="rounded-lg border border-[#1e293b] px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200"
+                        onClick={() => void syncFromChain()}
+                      >
+                        Refresh
+                      </button>
+                      <button
+                        className="rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90"
+                        onClick={() => setModalOpen(true)}
+                      >
+                        + Add Account / Funds
+                      </button>
+                    </div>
+                  </div>
+                  {tableEl}
+                </div>
+                <Terminal logs={logs} termRef={termRef} />
+              </div>
+            </>
+          )}
+
+          {tab === 'accounts' && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-medium text-slate-300">Monitored Accounts</div>
+                <div className="flex gap-2">
+                  <button
+                    className="rounded-lg border border-[#1e293b] px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200"
+                    onClick={() => void syncFromChain()}
+                  >
+                    Refresh
+                  </button>
+                  <button
+                    className="rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90"
+                    onClick={() => setModalOpen(true)}
+                  >
+                    + Add Account / Funds
+                  </button>
+                </div>
+              </div>
+              {tableEl}
+            </div>
+          )}
+
+          {tab === 'risk' && (
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
+                <div className="mb-4 text-sm font-medium text-slate-300">Protocol State (on-chain)</div>
+                <dl className="space-y-3 text-xs">
+                  {[
+                    ['Circuit breaker', paused ? 'ENGAGED — protocol paused' : 'disengaged — operational'],
+                    ['Safety threshold', `${asNum(protocol?.threshold) || THRESHOLD}%`],
+                    ['Consensus checks run', String(asNum(protocol?.total_checks))],
+                    ['Owner (can resume)', protocol?.owner ? short(protocol.owner) : '—'],
+                    ['Contract', short(contractAddr)],
+                  ].map(([k, v]) => (
+                    <div key={k} className="flex items-center justify-between border-b border-[#0e1526] pb-2 last:border-0">
+                      <dt className="text-slate-500">{k}</dt>
+                      <dd className={`font-mono ${String(v).startsWith('ENGAGED') ? 'text-rose-400' : 'text-slate-200'}`}>{v}</dd>
+                    </div>
+                  ))}
+                </dl>
+                <button
+                  className="mt-4 w-full rounded-lg border border-rose-500/40 px-3 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-500/10 disabled:opacity-50"
+                  onClick={() => void resumeProtocol()}
+                  disabled={resuming || !paused}
+                >
+                  {resuming ? 'Resuming…' : paused ? 'Resume Protocol (owner only)' : 'Protocol operational — nothing to resume'}
+                </button>
+              </div>
+              <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5 text-xs leading-relaxed text-slate-400">
+                <div className="mb-3 text-sm font-medium text-slate-300">How a Check() works</div>
+                <ol className="list-decimal space-y-2 pl-4">
+                  <li>Your Run Check() broadcasts <span className="font-mono text-cyan-300">check_and_protect</span> through MetaMask to the consensus contract.</li>
+                  <li>Five independent LLM validators each fetch the live {`{asset}`} price from Binance and recompute the collateral ratio.</li>
+                  <li>The equivalence principle requires them to agree on the verdict category (SAFE / WARNING / CRITICAL) — numeric drift from live prices is tolerated.</li>
+                  <li>SAFE holds, WARNING flags catastrophic AI sentiment, and a ratio below {THRESHOLD}% trips the circuit breaker and pauses the protocol.</li>
+                  <li>If the price feed is unreachable, validators use a fallback price and the verdict is flagged <span className="font-mono">[price feed unavailable — used fallback price]</span>.</li>
+                </ol>
+              </div>
+            </div>
+          )}
+
+          {tab === 'history' && (
+            <div className="overflow-hidden rounded-2xl border border-[#131c30] bg-[#0b1120]">
+              <div className="border-b border-[#131c30] px-5 py-3.5 text-sm font-medium text-slate-300">Transaction History</div>
+              {txLog.length === 0 ? (
+                <div className="px-5 py-8 text-center text-xs text-slate-600">
+                  No transactions yet — run a Check() or add an account.
+                </div>
+              ) : (
+                <div className="divide-y divide-[#0e1526]">
+                  {txLog.slice().reverse().map((l) => (
+                    <div key={l.id} className="flex flex-wrap items-center gap-3 px-5 py-3 text-xs">
+                      <span className="text-slate-600">[{l.time}]</span>
+                      <span className="flex-1 text-slate-300">{l.msg}</span>
+                      <a
+                        href={`${EXPLORER_TX}${l.txHash}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-mono text-cyan-400 underline decoration-dotted hover:text-cyan-300"
+                      >
+                        {short(l.txHash!)} ↗
+                      </a>
                     </div>
                   ))}
                 </div>
-              </div>
+              )}
             </div>
+          )}
 
-            <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
-              <div className="mb-3 text-sm font-medium text-slate-300">Collateral vs Debt</div>
-              <div className="flex items-center gap-4">
-                <Donut
-                  segments={[
-                    { label: 'Collateral', value: stats.coll, color: '#22d3ee' },
-                    { label: 'Debt', value: stats.debt, color: '#fb7185' },
-                  ]}
-                  centerLabel={`${stats.health}%`}
-                  centerSub="health"
-                />
-                <div className="space-y-2 text-xs">
-                  <div className="flex items-center gap-2">
-                    <span className="h-2.5 w-2.5 rounded-sm bg-cyan-400" />
-                    <span className="text-slate-300">Collateral</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="h-2.5 w-2.5 rounded-sm bg-rose-400" />
-                    <span className="text-slate-300">Debt</span>
-                  </div>
-                  <div className="pt-2 text-[11px] text-slate-600">
-                    Health = collateral ÷ debt. Below {THRESHOLD}% the engine trips the breaker.
-                  </div>
+          {tab === 'settings' && (
+            <div className="max-w-xl space-y-4">
+              <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
+                <div className="mb-1 text-sm font-medium text-slate-300">Contract Address</div>
+                <p className="mb-3 text-[11px] text-slate-500">
+                  Deployed CollateralGuard on {NETWORK_LABEL}. Keep the address exactly as the explorer shows it (checksummed) —
+                  the node&apos;s lookup is case-sensitive. Saved in this browser.
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    className="w-full rounded-lg border border-[#1e293b] bg-[#070b14] px-3 py-2 font-mono text-xs text-slate-200 outline-none focus:border-cyan-400/60"
+                    value={addrInput}
+                    onChange={(e) => setAddrInput(e.target.value)}
+                    spellCheck={false}
+                  />
+                  <button
+                    className="shrink-0 rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 px-4 py-2 text-xs font-semibold text-white hover:opacity-90"
+                    onClick={() => saveAddress()}
+                  >
+                    Save & Sync
+                  </button>
                 </div>
               </div>
-            </div>
 
-            <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
-              <div className="mb-1 text-sm font-medium text-slate-300">Portfolio Health — 27h</div>
-              <div className="text-[11px] text-slate-600">simulated timeline · live verdicts mark the current point</div>
-              <div className="mt-2 h-[200px]">
-                <HealthTimeline positions={positions} threshold={THRESHOLD} />
+              <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5 text-xs text-slate-400">
+                <div className="mb-3 text-sm font-medium text-slate-300">Connection</div>
+                <div className="space-y-2">
+                  <div className="flex justify-between"><span>Network</span><span className="font-mono text-slate-200">{NETWORK_LABEL} · 61999 (0xf22f)</span></div>
+                  <div className="flex justify-between"><span>RPC</span><span className="font-mono text-slate-200">studio.genlayer.com/api</span></div>
+                  <div className="flex justify-between"><span>Explorer</span><span className="font-mono text-slate-200">explorer-studio.genlayer.com</span></div>
+                  <div className="flex justify-between"><span>Wallet</span><span className="font-mono text-slate-200">{wallet ? short(wallet) : 'not connected'}</span></div>
+                  <div className="flex justify-between"><span>SDK</span><span className="font-mono text-slate-200">genlayer-js@1.1.8</span></div>
+                </div>
+                <button
+                  className="mt-4 w-full rounded-lg border border-[#1e293b] px-3 py-2 text-xs text-slate-300 hover:bg-[#0d1526] disabled:opacity-50"
+                  onClick={() => {
+                    void refreshProtocolState().then((st) => {
+                      if (st) pushLog('success', `Diagnostics OK — paused=${st.paused}, threshold=${st.threshold}, checks=${st.total_checks}`);
+                      else pushLog('error', 'Diagnostics failed — contract unreachable (check the address above)');
+                    });
+                  }}
+                >
+                  Run Diagnostics
+                </button>
               </div>
             </div>
-          </div>
-
-          {/* table + terminal */}
-          <div className="grid gap-4 xl:grid-cols-3">
-            <div className="xl:col-span-2">
-              <div className="overflow-hidden rounded-2xl border border-[#131c30] bg-[#0b1120]">
-                <div className="flex items-center justify-between border-b border-[#131c30] px-5 py-3.5">
-                  <div className="text-sm font-medium text-slate-300">Monitored Positions</div>
-                  <div className="flex gap-2">
-                    <button
-                      className="rounded-lg border border-[#1e293b] px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200"
-                      onClick={() => void syncFromChain()}
-                    >
-                      Refresh
-                    </button>
-                    <button
-                      className="rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90"
-                      onClick={() => setModalOpen(true)}
-                    >
-                      + Add Account / Funds
-                    </button>
-                  </div>
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-xs">
-                    <thead>
-                      <tr className="border-b border-[#131c30] text-[10px] uppercase tracking-widest text-slate-600">
-                        <th className="px-5 py-3 font-medium">Account</th>
-                        <th className="px-3 py-3 font-medium">Collateral</th>
-                        <th className="px-3 py-3 font-medium">Debt</th>
-                        <th className="px-3 py-3 font-medium">Ratio</th>
-                        <th className="px-3 py-3 font-medium">Status</th>
-                        <th className="px-5 py-3 text-right font-medium">Engine</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {positions.map((p) => (
-                        <tr key={p.address} className="border-b border-[#0e1526] last:border-0 hover:bg-[#0d1526]/60">
-                          <td className="px-5 py-3.5">
-                            <div className="font-mono text-slate-200">{short(p.address)}</div>
-                            <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-slate-600">
-                              {p.localOnly ? 'local preview' : 'on-chain'}
-                              {txByAccount[p.address] && (
-                                <a
-                                  href={`${EXPLORER_TX}${txByAccount[p.address]}`}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="text-cyan-500 underline decoration-dotted hover:text-cyan-400"
-                                >
-                                  tx ↗
-                                </a>
-                              )}
-                            </div>
-                          </td>
-                          <td className="px-3 py-3.5">
-                            <span className="font-semibold text-slate-200">{p.collateral_amount}</span>{' '}
-                            <span className="text-slate-500">{p.collateral_asset}</span>
-                            <div className="text-[10px] text-slate-600">
-                              {fmtUSD(p.collateral_amount * (DISPLAY_PRICES[p.collateral_asset] ?? 1000))}
-                            </div>
-                          </td>
-                          <td className="px-3 py-3.5 text-slate-400">{fmtUSD(p.debt_amount)}</td>
-                          <td className="px-3 py-3.5">
-                            <div className={`font-semibold ${p.last_ratio >= THRESHOLD ? 'text-emerald-400' : p.last_ratio > 0 ? 'text-rose-400' : 'text-slate-500'}`}>
-                              {p.last_ratio > 0 ? `${p.last_ratio}%` : '—'}
-                            </div>
-                            <div className="relative mt-1 h-1.5 w-20 rounded bg-[#141d33]">
-                              <div
-                                className={`h-1.5 rounded ${p.last_ratio >= THRESHOLD ? 'bg-emerald-400' : 'bg-rose-400'}`}
-                                style={{ width: `${Math.min(100, (p.last_ratio / 300) * 100)}%` }}
-                              />
-                              <div className="absolute -top-1 h-3.5 w-px bg-rose-400/60" style={{ left: `${(THRESHOLD / 300) * 100}%` }} />
-                            </div>
-                          </td>
-                          <td className="px-3 py-3.5">
-                            <StatusBadge status={p.status} />
-                            <div className="mt-1 max-w-[220px] truncate text-[10px] text-slate-600" title={p.last_message}>
-                              {p.last_message}
-                            </div>
-                          </td>
-                          <td className="px-5 py-3.5 text-right">
-                            <button
-                              className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-40"
-                              onClick={() => void runCheck(p)}
-                              disabled={checkingAddr !== null}
-                            >
-                              {checkingAddr === p.address ? 'Validators…' : 'Run Check()'}
-                            </button>
-                            <div className="mt-1 text-[10px] text-slate-600">{p.last_checked}</div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-
-            <Terminal logs={logs} termRef={termRef} />
-          </div>
+          )}
         </div>
       </main>
 
