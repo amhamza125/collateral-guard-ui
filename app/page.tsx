@@ -856,7 +856,7 @@ export default function Page() {
   const trackTxRef = useRef<((hash: string, attempts?: number, delayMs?: number) => Promise<TxRecord>) | null>(null);
   const verboseRef = useRef(false);
   const termRef = useRef<HTMLDivElement | null>(null);
-
+  const mobileTermRef = useRef<HTMLDivElement | null>(null);
   const paused = protocol?.paused === true;
   const liveThreshold = asNum(protocol?.threshold) || DEFAULT_THRESHOLD;
 
