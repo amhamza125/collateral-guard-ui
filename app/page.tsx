@@ -328,7 +328,7 @@ function HealthTimeline({
   prices: Record<string, number>;
   history: CheckEvent[];
 }) {
-  const real = history.length >= 2;
+  const real = history.length >= 1;
   const series = useMemo(() => {
     if (real) {
       const pts = history.slice(-20).map((h) => ({ v: Math.min(340, Math.max(60, h.ratio ?? 0)), label: `#${h.seq ?? 0}` }));
@@ -392,6 +392,9 @@ function HealthTimeline({
       <text x={44} y={y(threshold) - 5} fontSize="9" fill="#fb7185">LIQ THRESHOLD {threshold}%</text>
       {area && <path d={area} fill="url(#healthFill)" />}
       <polyline points={line} fill="none" stroke="#22d3ee" strokeWidth="2" strokeLinejoin="round" />
+      {real && n === 1 && (
+        <line x1={40} x2={W - 20} y1={lastY} y2={lastY} stroke="#22d3ee" strokeWidth="1.5" strokeDasharray="2 5" opacity="0.8" />
+      )}
       {real && series.pts.map((p, i) => (
         <circle key={i} cx={x(i)} cy={y(p)} r="2.5" fill={p < threshold ? '#fb7185' : '#22d3ee'} />
       ))}
@@ -981,11 +984,24 @@ export default function Page() {
 
   const callView = useCallback(
     async (method: string, args: unknown[] = []): Promise<unknown> => {
-      return await getReadClient().readContract({
-        address: contractAddr as `0x${string}`,
-        functionName: method,
-        args: args as any,
-      });
+      let lastErr: any;
+      // the Studio RPC occasionally drops a request ("Failed to fetch") —
+      // retry transient transport errors; contract-level reverts fail fast
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          return await getReadClient().readContract({
+            address: contractAddr as `0x${string}`,
+            functionName: method,
+            args: args as any,
+          });
+        } catch (e: any) {
+          lastErr = e;
+          const msg = String(e?.message ?? e);
+          if (/not found|revert|execution|invalid/i.test(msg)) throw e;
+          if (attempt < 2) await sleep(1500);
+        }
+      }
+      throw lastErr;
     },
     [contractAddr],
   );
@@ -1792,9 +1808,9 @@ export default function Page() {
                 <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
                   <div className="mb-1 text-sm font-medium text-slate-300">Check History</div>
                   <div className="text-[11px] text-slate-600">
-                    {checkEvents.length >= 2
-                      ? `real on-chain ratios · last ${checkEvents.length} checks`
-                      : 'run 2+ checks to build the real history'}
+                    {checkEvents.length >= 1
+                      ? `real on-chain ratios · ${checkEvents.length} check${checkEvents.length > 1 ? 's' : ''} recorded`
+                      : 'run checks to build the real history'}
                   </div>
                   <div className="mt-2 h-[200px]">
                     <HealthTimeline
