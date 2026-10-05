@@ -32,7 +32,7 @@ declare global {
 
 /* ─────────────────────────────── CONFIG ─────────────────────────────── */
 
-const DEFAULT_CONTRACT_ADDRESS = '0xaCBd7A2861E5f41276F17ffCF0881906798988C4';
+const DEFAULT_CONTRACT_ADDRESS = '0xaDb4c550eE8d345c5A1Bad83073C3103C7660766';
 const ADDRESS_STORAGE_KEY = 'cg_contract_address';
 const ADDRESS_HISTORY_KEY = 'cg_address_history';
 const TXS_STORAGE_KEY = 'cg_txs';
@@ -182,12 +182,16 @@ type ProtocolState = {
 };
 
 type CheckEvent = {
-  seq: number;
+  type?: 'ADD' | 'CHECK';
+  seq?: number;
   account: string;
   asset: string;
-  ratio: number;
-  status: string;
+  ratio?: number;
+  status?: string;
   price_source?: string;
+  collateral_amount?: number;
+  debt_amount?: number;
+  debt_asset?: string;
   message: string;
 };
 
@@ -841,6 +845,7 @@ export default function Page() {
   const [livePrices, setLivePrices] = useState<Record<string, number> | null>(null);
   const [priceStamp, setPriceStamp] = useState<string | null>(null);
   const [verbose, setVerbose] = useState(false);
+  const [lastSyncStamp, setLastSyncStamp] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [activityOpen, setActivityOpen] = useState(true);
   const [activityMobileOpen, setActivityMobileOpen] = useState(false);
@@ -857,6 +862,7 @@ export default function Page() {
   const verboseRef = useRef(false);
   const termRef = useRef<HTMLDivElement | null>(null);
   const mobileTermRef = useRef<HTMLDivElement | null>(null);
+
   const paused = protocol?.paused === true;
   const liveThreshold = asNum(protocol?.threshold) || DEFAULT_THRESHOLD;
 
@@ -1056,12 +1062,16 @@ export default function Page() {
           }
           setSynced(true);
           const n = list.length;
-          vlog(`sync: merged ${n} monitored account(s) from chain`);
+          const changed = n !== lastSyncCountRef.current;
+          if (changed) vlog(`sync: merged ${n} monitored account(s) from chain`);
           if (!opts?.silent && n !== lastSyncCountRef.current) {
             pushLog('success', `Synced ${n} monitored account(s) from GenVM state`);
           }
           lastSyncCountRef.current = n;
+        } else if (!Array.isArray(list)) {
+          vlog('sync: unexpected response shape');
         }
+        setLastSyncStamp(new Date().toLocaleTimeString('en-GB'));
         await refreshProtocolState();
         await refreshHistory();
       } catch (e: any) {
@@ -1070,6 +1080,8 @@ export default function Page() {
           pushLog('error', `Contract ${short(contractAddr)} not found on ${NETWORK_LABEL} — check the address (Settings) and keep it exactly checksummed`);
         } else if (!opts?.silent) {
           pushLog('error', `Chain read failed: ${msg.slice(0, 160)}`);
+        } else {
+          vlog(`sync failed: ${msg.slice(0, 120)}`);
         }
       } finally {
         syncingRef.current = false;
@@ -1077,6 +1089,14 @@ export default function Page() {
     },
     [callView, pushLog, refreshProtocolState, refreshHistory, upsertPosition, vlog, contractAddr],
   );
+
+  // real-time synchronization: poll contract state on an interval so the
+  // dashboard always mirrors what the explorer shows (reads need no wallet)
+  useEffect(() => {
+    void syncFromChain({ silent: true });
+    const iv = setInterval(() => void syncFromChain({ silent: true }), 12_000);
+    return () => clearInterval(iv);
+  }, [syncFromChain]);
 
   /** Broadcast a write and register it in the live transaction panel. */
   const sendWrite = useCallback(
@@ -1507,32 +1527,33 @@ export default function Page() {
   const otherAddresses = addrHistory.filter((a) => a.toLowerCase() !== contractAddr.toLowerCase());
   const visibleTxs = txScope === 'all' ? txs : txs.filter((t) => (t.contract ?? '').toLowerCase() === contractAddr.toLowerCase());
 
-  // On-chain activity feed: real check events from the contract + derived
-  // "position added" markers for accounts still awaiting their first check.
+  // On-chain activity feed: every ADD and CHECK recorded by the contract,
+  // newest first — this is what makes the tab mirror the explorer.
+  const checkEvents = useMemo(() => history.filter((h) => (h.type ?? 'CHECK') === 'CHECK'), [history]);
+
   const onChainEvents = useMemo(() => {
     const evts: { kind: 'ADD' | 'CHECK'; seq: number; account: string; status: string; detail: string }[] = [];
-    for (const p of positions) {
-      if (p.last_checked === 'NEVER') {
+    for (const h of [...history].reverse()) {
+      if (h.type === 'ADD') {
         evts.push({
           kind: 'ADD',
           seq: 0,
-          account: p.address,
+          account: h.account,
           status: 'SAFE',
-          detail: `${p.collateral_amount} ${p.collateral_asset} added — awaiting first check`,
+          detail: `${h.collateral_amount} ${h.asset} added vs ${h.debt_amount} ${h.debt_asset ?? 'USDT'} debt`,
+        });
+      } else {
+        evts.push({
+          kind: 'CHECK',
+          seq: h.seq ?? 0,
+          account: h.account,
+          status: h.status ?? 'SAFE',
+          detail: `${h.asset} · ratio ${h.ratio ?? 0}% · ${h.message}`,
         });
       }
     }
-    for (const h of [...history].reverse()) {
-      evts.push({
-        kind: 'CHECK',
-        seq: h.seq,
-        account: h.account,
-        status: h.status,
-        detail: `${h.asset} · ratio ${h.ratio}% · ${h.message}`,
-      });
-    }
     return evts;
-  }, [positions, history]);
+  }, [history]);
 
   const tableEl = (
     <PositionsTable
@@ -1771,8 +1792,8 @@ export default function Page() {
                 <div className="rounded-2xl border border-[#131c30] bg-[#0b1120] p-5">
                   <div className="mb-1 text-sm font-medium text-slate-300">Check History</div>
                   <div className="text-[11px] text-slate-600">
-                    {history.length >= 2
-                      ? `real on-chain ratios · last ${history.length} checks`
+                    {checkEvents.length >= 2
+                      ? `real on-chain ratios · last ${checkEvents.length} checks`
                       : 'run 2+ checks to build the real history'}
                   </div>
                   <div className="mt-2 h-[200px]">
@@ -1780,7 +1801,7 @@ export default function Page() {
                       positions={positions}
                       threshold={liveThreshold}
                       prices={livePrices ?? DISPLAY_PRICES}
-                      history={history}
+                      history={checkEvents}
                     />
                   </div>
                 </div>
@@ -1788,7 +1809,12 @@ export default function Page() {
 
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <div className="text-sm font-medium text-slate-300">Monitored Positions</div>
+                  <div>
+                    <div className="text-sm font-medium text-slate-300">Monitored Positions</div>
+                    <div className="text-[10px] text-slate-600">
+                      auto-sync every 12s{lastSyncStamp ? ` · updated ${lastSyncStamp}` : ''}
+                    </div>
+                  </div>
                   <div className="flex gap-2">
                     <button
                       className="rounded-lg border border-[#1e293b] px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200"
@@ -1880,7 +1906,7 @@ export default function Page() {
                   <li>Five independent LLM validators each fetch the live asset price (Binance → Coinbase → CoinGecko fallback chain) and recompute the collateral ratio.</li>
                   <li>The equivalence principle requires them to agree on the verdict category (SAFE / WARNING / CRITICAL) — numeric drift from live prices is tolerated.</li>
                   <li>SAFE holds, WARNING flags catastrophic AI sentiment (advisory), and a ratio below the threshold <span className="italic">at check time</span> trips the circuit breaker and pauses the protocol.</li>
-                  <li>Every check is recorded on-chain — the Dashboard timeline plots the real ratios from <span className="font-mono text-cyan-300">get_check_history</span>.</li>
+                  <li>Every add and every check is recorded on-chain — the Transactions tab lists them and the Dashboard timeline plots the real ratios from <span className="font-mono text-cyan-300">get_check_history</span>.</li>
                 </ol>
               </div>
             </div>
