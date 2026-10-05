@@ -331,8 +331,7 @@ function HealthTimeline({
   const real = history.length >= 2;
   const series = useMemo(() => {
     if (real) {
-      const pts = history.slice(-20).map((h) => ({ v: Math.min(340, Math.max(60, h.ratio)), label: `#${h.seq}` }));
-      return { pts: pts.map((p) => p.v), current: pts.length ? pts[pts.length - 1].v : 0, labels: pts.map((p) => p.label) };
+       => ({ v: Math.min(340, Math.max(60, h.ratio ?? 0)), label: `#${h.seq ?? 0}` }));
     }
     const coll = positions.reduce((s, p) => s + p.collateral_amount * (prices[p.collateral_asset] ?? 1000), 0);
     const debt = Math.max(1, positions.reduce((s, p) => s + p.debt_amount, 0));
