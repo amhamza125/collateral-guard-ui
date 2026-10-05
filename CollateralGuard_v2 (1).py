@@ -7,9 +7,11 @@ _FALLBACK_PRICES = {"BTC": 64000, "ETH": 3200, "SOL": 150}
 
 class CollateralGuard(gl.Contract):
     global_threshold: bigint
-    protocol_paused: bool
+    protocol_paused: bool          # owner-only emergency stop -- never auto-set by a check
     monitored_accounts: TreeMap[str, str]
-    check_history: TreeMap[str, str]
+    account_index: TreeMap[bigint, str]   # index -> address, in registration order
+    account_count: bigint
+    check_history: TreeMap[bigint, str]   # sequence number -> JSON payload
     owner: str
     total_checks: bigint
     activity_count: bigint
@@ -18,7 +20,9 @@ class CollateralGuard(gl.Contract):
         self.global_threshold = 150
         self.protocol_paused = False
         self.monitored_accounts = TreeMap[str, str]()
-        self.check_history = TreeMap[str, str]()
+        self.account_index = TreeMap[bigint, str]()
+        self.account_count = 0
+        self.check_history = TreeMap[bigint, str]()
         self.owner = str(gl.message.sender_address)
         self.total_checks = 0
         self.activity_count = 0
@@ -31,6 +35,16 @@ class CollateralGuard(gl.Contract):
         if "SOL" in asset:
             return "SOL"
         return "ETH"
+
+    def _log_activity(self, payload: dict) -> None:
+        # Fix: previously keyed by a composite "seq:address" string and
+        # recovered via "for k in self.check_history" -- iterating all keys
+        # of a TreeMap has never actually been confirmed to work in this
+        # project; only direct single-key lookups have been proven reliable
+        # every time. This now uses a plain incrementing bigint key with
+        # direct indexed reads in get_check_history below.
+        self.activity_count += 1
+        self.check_history[self.activity_count] = json.dumps(payload)
 
     @gl.public.write
     def add_monitored_account(
@@ -46,12 +60,16 @@ class CollateralGuard(gl.Contract):
         if len(account_address) < 8:
             raise Exception("INVALID_ADDRESS")
 
+        if account_address in self.monitored_accounts:
+            raise Exception("ALREADY_MONITORED: this account is already registered")
+
         self.monitored_accounts[account_address] = json.dumps({
             "collateral_amount": collateral_amount,
             "debt_amount": debt_amount,
             "collateral_asset": collateral_asset,
             "debt_asset": debt_asset,
             "status": "SAFE",
+            "locked": False,
             "last_ratio": 0,
             "ai_sentiment": "N/A",
             "price_source": "N/A",
@@ -60,12 +78,19 @@ class CollateralGuard(gl.Contract):
             "added_by": str(gl.message.sender_address),
         })
 
-        # Record EVERY add in the on-chain activity log — re-adding the same
-        # address overwrites the position state, so without this entry the
-        # transaction would be invisible in any history view.
-        self.activity_count += 1
-        seq = str(int(self.activity_count)).zfill(6)
-        self.check_history[f"{seq}:{account_address}"] = json.dumps({
+        # Fix: this is the actual cause of "adding a new position wipes the
+        # old ones from the dashboard". get_all_accounts previously did
+        # "for addr in self.monitored_accounts: ..." to list every
+        # registered account -- iterating all keys of a TreeMap has never
+        # been confirmed to work in this project, and evidently does not
+        # return every key reliably. account_index + account_count now
+        # track every registered address explicitly, read back via direct
+        # indexed lookups (self.account_index[bigint(i)]) -- the same kind
+        # of access that has worked correctly in every contract so far.
+        self.account_index[self.account_count] = account_address
+        self.account_count += 1
+
+        self._log_activity({
             "type": "ADD",
             "account": account_address,
             "asset": collateral_asset,
@@ -79,30 +104,24 @@ class CollateralGuard(gl.Contract):
     @gl.public.write
     def check_and_protect(self, account_address: str) -> str:
         if self.protocol_paused:
-            raise Exception("PROTOCOL_PAUSED: circuit breaker is active — the owner must resume first")
+            raise Exception("PROTOCOL_PAUSED: owner has engaged the emergency stop")
         if account_address not in self.monitored_accounts:
             raise Exception("ACCOUNT_NOT_FOUND")
 
         pos = json.loads(self.monitored_accounts[account_address])
+        if pos.get("locked"):
+            raise Exception("ACCOUNT_LOCKED: this position breached previously — owner must call resume_account first")
+
         symbol = self._symbol_of(pos["collateral_asset"])
         collateral_amount = pos["collateral_amount"]
         debt_amount = pos["debt_amount"]
         threshold = self.global_threshold
 
         def evaluate():
-            # Both the price fetch AND the LLM call must live inside this
-            # single function so GenVM can trace them as reachable from the
-            # consensus mechanism below.
             price = _FALLBACK_PRICES[symbol]
             price_source = "STATIC_FALLBACK"
             used_fallback = False
 
-            # Live price sources in preference order. GenLayer validators
-            # could not reach Binance (geo-blocked) in live testing, so each
-            # validator walks the chain and uses the first source that
-            # answers. Small cross-source price differences are tolerated by
-            # the prompt_comparative principle below (the verdict category
-            # must match; numeric drift is acceptable).
             if symbol == "BTC":
                 coinbase_pair, gecko_id = "BTC-USD", "bitcoin"
             elif symbol == "SOL":
@@ -183,19 +202,16 @@ class CollateralGuard(gl.Contract):
 
         self.total_checks += 1
 
-        # Persist state BEFORE returning for every path -- GenVM reverts all
-        # state changes if the method raises, so the status / circuit
-        # breaker must never depend on an exception being thrown afterward.
         if breach:
-            self.protocol_paused = True
             pos["status"] = "CRITICAL"
+            pos["locked"] = True
             pos["ai_sentiment"] = sentiment
             pos["price_source"] = price_source
             pos["last_ratio"] = ratio
             pos["last_checked"] = f"CHECK #{self.total_checks}"
             pos["last_message"] = (
                 f"CRITICAL_BREACH: ratio {ratio}% < {threshold}% — "
-                f"CIRCUIT_BREAKER_ENGAGED, protocol paused{fallback_note}"
+                f"ACCOUNT_LOCKED, awaiting owner resume_account(){fallback_note}"
             )
         elif sentiment == "CATASTROPHIC":
             pos["status"] = "WARNING"
@@ -220,11 +236,7 @@ class CollateralGuard(gl.Contract):
 
         self.monitored_accounts[account_address] = json.dumps(pos)
 
-        # Append to the real on-chain activity log (zero-padded key so
-        # lexicographic TreeMap order equals numeric order).
-        self.activity_count += 1
-        seq = str(int(self.activity_count)).zfill(6)
-        self.check_history[f"{seq}:{account_address}"] = json.dumps({
+        self._log_activity({
             "type": "CHECK",
             "seq": int(self.total_checks),
             "account": account_address,
@@ -237,11 +249,39 @@ class CollateralGuard(gl.Contract):
         return pos["last_message"]
 
     @gl.public.write
+    def resume_account(self, account_address: str) -> str:
+        """Owner-only: clears a single locked (CRITICAL) position so it can be checked again."""
+        if str(gl.message.sender_address) != self.owner:
+            raise Exception("ONLY_OWNER: only the deployer can resume a locked account")
+        if account_address not in self.monitored_accounts:
+            raise Exception("ACCOUNT_NOT_FOUND")
+
+        pos = json.loads(self.monitored_accounts[account_address])
+        pos["locked"] = False
+        pos["last_message"] = "ACCOUNT_RESUMED: lock cleared by owner, awaiting next check()"
+        self.monitored_accounts[account_address] = json.dumps(pos)
+
+        self._log_activity({
+            "type": "RESUME_ACCOUNT",
+            "account": account_address,
+            "message": pos["last_message"],
+        })
+        return pos["last_message"]
+
+    @gl.public.write
+    def pause_protocol(self) -> str:
+        """Owner-only emergency stop — halts ALL checks until resume_protocol is called."""
+        if str(gl.message.sender_address) != self.owner:
+            raise Exception("ONLY_OWNER: only the deployer can pause the protocol")
+        self.protocol_paused = True
+        return "PROTOCOL_PAUSED: emergency stop engaged by owner"
+
+    @gl.public.write
     def resume_protocol(self) -> str:
         if str(gl.message.sender_address) != self.owner:
             raise Exception("ONLY_OWNER: only the deployer can resume the protocol")
         self.protocol_paused = False
-        return "PROTOCOL_RESUMED: circuit breaker disengaged"
+        return "PROTOCOL_RESUMED: emergency stop disengaged"
 
     @gl.public.write
     def set_threshold(self, new_threshold: int) -> str:
@@ -261,7 +301,9 @@ class CollateralGuard(gl.Contract):
     @gl.public.view
     def get_all_accounts(self) -> str:
         out = []
-        for addr in self.monitored_accounts:
+        count = int(self.account_count)
+        for i in range(count):
+            addr = self.account_index[bigint(i)]
             record = json.loads(self.monitored_accounts[addr])
             record["address"] = addr
             out.append(record)
@@ -269,13 +311,11 @@ class CollateralGuard(gl.Contract):
 
     @gl.public.view
     def get_check_history(self, limit: int) -> str:
+        total = int(self.activity_count)
+        start = max(1, total - limit + 1) if limit > 0 else 1
         out = []
-        keys = []
-        for k in self.check_history:
-            keys.append(k)
-        recent = keys[-limit:] if limit > 0 else keys
-        for k in recent:
-            out.append(json.loads(self.check_history[k]))
+        for i in range(start, total + 1):
+            out.append(json.loads(self.check_history[bigint(i)]))
         return json.dumps(out)
 
     @gl.public.view
@@ -286,3 +326,4 @@ class CollateralGuard(gl.Contract):
             "owner": self.owner,
             "total_checks": str(self.total_checks),
         })
+        
