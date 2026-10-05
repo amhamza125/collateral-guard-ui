@@ -32,7 +32,7 @@ declare global {
 
 /* ─────────────────────────────── CONFIG ─────────────────────────────── */
 
-const DEFAULT_CONTRACT_ADDRESS = '0xaDb4c550eE8d345c5A1Bad83073C3103C7660766';
+const DEFAULT_CONTRACT_ADDRESS = '0xaCBd7A2861E5f41276F17ffCF0881906798988C4';
 const ADDRESS_STORAGE_KEY = 'cg_contract_address';
 const ADDRESS_HISTORY_KEY = 'cg_address_history';
 const TXS_STORAGE_KEY = 'cg_txs';
