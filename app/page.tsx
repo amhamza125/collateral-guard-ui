@@ -1511,6 +1511,39 @@ export default function Page() {
     [wallet, busy, pushLog, sendWrite, trackTx, upsertPosition, pollPosition],
   );
 
+  const pauseProtocol = useCallback(async () => {
+    if (!wallet) {
+      pushLog('error', 'Connect the deployer wallet first');
+      return;
+    }
+    if (busy) return;
+    setBusy(true);
+    setResuming(true);
+    pushLog('info', 'pause_protocol() — owner emergency stop, halts ALL checks…');
+    try {
+      const hash = await sendWrite('pause_protocol', []);
+      const outcome = await trackTx(hash);
+      if (outcome.state === 'REVERTED') {
+        pushLog('error', `pause_protocol REVERTED on-chain: ${outcome.revertReason ?? 'contract error'}`, hash);
+        return;
+      }
+      for (let i = 0; i < 8; i++) {
+        const st = await refreshProtocolState();
+        if (st && st.paused === true) {
+          pushLog('warn', outcome.output ?? 'PROTOCOL_PAUSED: emergency stop engaged — every check will revert until resumed', hash);
+          return;
+        }
+        await sleep(4000);
+      }
+      pushLog('warn', 'Pause still settling in consensus — check again shortly', hash);
+    } catch (e: any) {
+      pushLog('error', `pause_protocol failed: ${e?.shortMessage ?? e?.message ?? e}`);
+    } finally {
+      setResuming(false);
+      setBusy(false);
+    }
+  }, [wallet, busy, pushLog, sendWrite, trackTx, refreshProtocolState]);
+
   const updateThreshold = useCallback(
     async (value: number) => {
       if (!wallet) {
@@ -1597,6 +1630,7 @@ export default function Page() {
   const inFlight = txs.filter((t) => t.state === 'IN_FLIGHT').length;
   const otherAddresses = addrHistory.filter((a) => a.toLowerCase() !== contractAddr.toLowerCase());
   const visibleTxs = txScope === 'all' ? txs : txs.filter((t) => (t.contract ?? '').toLowerCase() === contractAddr.toLowerCase());
+  const lockedPositions = positions.filter((p) => p.locked || /ACCOUNT_LOCKED/i.test(p.last_message));
 
   // On-chain activity feed: every ADD and CHECK recorded by the contract,
   // newest first — this is what makes the tab mirror the explorer.
@@ -1701,6 +1735,27 @@ export default function Page() {
           {unconfigured && (
             <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-xs text-amber-300">
               Demo mode — no contract address configured. Deploy CollateralGuard.py and set the address in the Settings tab.
+            </div>
+          )}
+
+          {lockedPositions.length > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3">
+              <div className="flex items-center gap-3 text-sm text-rose-300">
+                <span className="h-2 w-2 animate-ping rounded-full bg-rose-400" />
+                <span className="font-semibold">
+                  {lockedPositions.length} position{lockedPositions.length > 1 ? 's' : ''} LOCKED after breach
+                </span>
+                <span className="text-rose-300/70">
+                  {short(lockedPositions[0].address)} hit {lockedPositions[0].last_ratio}% — checks for it revert until the owner resumes it.
+                </span>
+              </div>
+              <button
+                className="rounded-lg border border-emerald-500/40 px-3 py-1.5 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
+                onClick={() => lockedPositions.forEach((p) => void resumeAccount(p))}
+                disabled={busy}
+              >
+                Resume locked (owner)
+              </button>
             </div>
           )}
 
@@ -1907,6 +1962,16 @@ export default function Page() {
                   >
                     {resuming ? 'Working…' : paused ? 'Resume Protocol (owner only)' : 'Protocol operational — nothing to resume'}
                   </button>
+                  {!paused && (
+                    <button
+                      className="w-full rounded-lg border border-[#1e293b] px-3 py-2 text-xs text-slate-300 hover:bg-rose-500/10 disabled:opacity-50"
+                      onClick={() => void pauseProtocol()}
+                      disabled={busy || resuming || !wallet}
+                      title="Owner-only emergency stop — halts ALL checks until resumed"
+                    >
+                      Pause Protocol (emergency stop)
+                    </button>
+                  )}
                   <div className="rounded-lg border border-[#1e293b] p-3">
                     <div className="mb-2 text-[10px] uppercase tracking-widest text-slate-500">Liquidation threshold (owner only)</div>
                     <ThresholdControl
