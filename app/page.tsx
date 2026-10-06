@@ -1,36 +1,77 @@
-10:41:27.360 Running build in Washington, D.C., USA (East) – iad1
-10:41:27.361 Build machine configuration: 2 cores, 8 GB
-10:41:27.578 Cloning github.com/amhamza125/collateral-guard-ui (Branch: main, Commit: 4cc89bc)
-10:41:28.245 Cloning completed: 666.000ms
-10:41:29.140 Restored build cache from previous deployment (2AEjoAEYDyjmmWuQXD6cAuyMpkf9)
-10:41:30.002 Running "vercel build"
-10:41:30.019 Vercel CLI 62.1.0
-10:41:30.309 Installing dependencies...
-10:41:36.650 
-10:41:36.651 up to date in 6s
-10:41:36.653 
-10:41:36.654 161 packages are looking for funding
-10:41:36.654   run `npm fund` for details
-10:41:36.654 npm warn install-scripts 1 package has install scripts not yet covered by allowScripts:
-10:41:36.655 npm warn install-scripts   unrs-resolver@1.12.2 (postinstall: node postinstall.js)
-10:41:36.655 npm warn install-scripts
-10:41:36.655 npm warn install-scripts Run `npm install-scripts ls` to review, or `npm install-scripts approve <pkg>` to allow.
-10:41:36.706 Detected Next.js version: 16.3.8
-10:41:36.717 Running "npm run build"
-10:41:36.919 
-10:41:36.919 > collateral-guard-ui@0.1.0 build
-10:41:36.919 > next build
-10:41:36.919 
-10:41:37.653 ▲ Next.js 16.3.8 (Turbopack)
-10:41:38.031   Applying modifyConfig from Vercel
-10:41:38.033 ✓ Running next.config.ts took 379ms
-10:41:38.055 
-10:41:38.108   Creating an optimized production build ...
-10:41:44.312 ✓ Compiled successfully in 5.2s
-10:41:44.317   Running TypeScript ...
-10:41:49.688 app/page.tsx(264,11): error TS2322: Type 'unknown[]' is not assignable to type 'CalldataEncodable[]'.
-10:41:49.689   Type 'unknown' is not assignable to type 'CalldataEncodable'.
-10:41:49.689 app/page.tsx(265,11): error TS2322: Type 'number' is not assignable to type 'bigint'.
-10:41:49.737 Failed to type check.
-10:41:49.738 
-10:41:49.818 Error: Command "npm run build" exited with 1
+'use client';
+
+/**
+ * CollateralGuard Console — testing dashboard for the CollateralGuard
+ * Intelligent Contract (v5).
+ *
+ * SETUP
+ *   1. npm install genlayer-js
+ *   2. Deploy CollateralGuard_v5.py via GenLayer Studio to Testnet Bradbury.
+ *   3. Set NEXT_PUBLIC_GUARD_ADDRESS in .env.local, or edit the fallback
+ *      address below.
+ *
+ * DESIGN NOTES
+ *   This is a deliberate rewrite, not a patch of the earlier version. Every
+ *   read comes from a single refreshAll() call straight after any write —
+ *   there is no local optimistic merging of contract state, which is what
+ *   produced the "old position disappears" bug previously. One source of
+ *   truth, re-fetched every time, is slower but cannot drift out of sync.
+ *
+ *   All contract calls go through genlayer-js (the official SDK) — no
+ *   hand-rolled calldata encoding.
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createClient } from 'genlayer-js';
+import { testnetBradbury } from 'genlayer-js/chains';
+import { TransactionStatus } from 'genlayer-js/types';
+
+declare global {
+  interface Window {
+    ethereum?: any;
+  }
+}
+
+/** Derived directly from genlayer-js's own writeContract signature, rather
+ * than guessing the exported type name for its calldata arg/value types —
+ * this stays correct even if genlayer-js renames those types internally. */
+type WriteContractParams = Parameters<ReturnType<typeof createClient>['writeContract']>[0];
+type WriteArgs = WriteContractParams['args'];
+type WriteValue = WriteContractParams['value'];
+
+/* ───────────────────────────── configuration ───────────────────────────── */
+
+const CONTRACT_ADDRESS = (
+  process.env.NEXT_PUBLIC_GUARD_ADDRESS ?? '0xaCBd7A2861E5f41276F17ffCF0881906798988C4'
+).toLowerCase() as `0x${string}`;
+
+          <p className="mt-0.5 text-xs text-[#83888f]">
+            {position.collateral_amount} {position.collateral_asset} vs {position.debt_amount} {position.debt_asset}
+          </p>
+        </div>
+        <span className={`rounded-full border px-2.5 py-0.5 text-xs font-medium ${STATUS_STYLE[position.status]}`}>
+          {position.status}
+        </span>
+      </div>
+      <p className="mt-2 text-xs text-[#83888f]">{position.last_message}</p>
+      <div className="mt-3 flex items-center gap-2">
+        <button
+          onClick={onCheck}
+          disabled={!!pending || position.locked}
+          className="btn-secondary"
+          title={position.locked ? 'Locked — owner must resume this account first' : undefined}
+        >
+          {checking ? 'Checking…' : 'Run check'}
+        </button>
+        {position.locked && isOwner && (
+          <button onClick={onResume} disabled={!!pending} className="btn-secondary">
+            {resuming ? 'Resuming…' : 'Resume account'}
+          </button>
+        )}
+        {position.locked && !isOwner && (
+          <span className="text-xs text-[#83888f]">Locked — awaiting owner resume</span>
+        )}
+      </div>
+    </div>
+  );
+}
