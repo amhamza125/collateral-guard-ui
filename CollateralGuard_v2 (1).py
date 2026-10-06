@@ -17,12 +17,16 @@ class CollateralGuard(gl.Contract):
     activity_count: bigint
 
     def __init__(self):
+        # TreeMap fields (monitored_accounts, account_index, check_history)
+        # are NOT assigned here -- GenVM zero-initializes them automatically
+        # the moment they're declared, the same rule already confirmed for
+        # DynArray. Manually assigning a fresh TreeMap(), which worked
+        # earlier in this project, now fails against the current GenVM/
+        # Studio version with the same "Is right the same storage type?"
+        # assertion DynArray raises for manual construction.
         self.global_threshold = 150
         self.protocol_paused = False
-        self.monitored_accounts = TreeMap[str, str]()
-        self.account_index = TreeMap[bigint, str]()
         self.account_count = 0
-        self.check_history = TreeMap[bigint, str]()
         self.owner = str(gl.message.sender_address)
         self.total_checks = 0
         self.activity_count = 0
