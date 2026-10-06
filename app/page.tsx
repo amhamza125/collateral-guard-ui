@@ -1203,6 +1203,12 @@ export default function Page() {
 
           if (DECIDED.has(statusNum) && leader && execStatus) {
             const output = leader?.result?.raw ? decodeReturnPayload(String(leader.result.raw)) : undefined;
+            // prefer the FINALIZED receipt — the return payload can still be
+            // empty at ACCEPTED; keep polling unless we're nearly out of attempts
+            if (statusNum === 5 && !output && i < attempts - 6) {
+              updateTx(hash, patch);
+              continue;
+            }
             patch.state = 'EXECUTED';
             patch.output = output;
             latest = { hash, contract: '', method: '', argsSummary: '', time: '', ts: Date.now(), state: 'EXECUTED', chainStatus, votesAgree: agree, votesTotal: voteVals.length, output };
