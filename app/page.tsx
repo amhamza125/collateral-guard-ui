@@ -183,7 +183,7 @@ type ProtocolState = {
 };
 
 type CheckEvent = {
-  type?: 'ADD' | 'CHECK';
+  type?: 'ADD' | 'CHECK' | 'RESUME_ACCOUNT';
   seq?: number;
   account: string;
   asset: string;
