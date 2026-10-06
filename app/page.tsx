@@ -170,6 +170,7 @@ type Position = {
   ai_sentiment?: string;
   last_message: string;
   last_checked: string;
+  locked?: boolean;
   updatedTs?: number;
   localOnly?: boolean;
 };
@@ -717,16 +718,18 @@ function AddFundsModal({
 }
 
 function PositionsTable({
-  positions, txByAccount, checkingAddr, onCheck, priceOf, threshold, synced, wallet,
+  positions, txByAccount, checkingAddr, onCheck, onResume, priceOf, threshold, synced, wallet, busy,
 }: {
   positions: Position[];
   txByAccount: Record<string, string>;
   checkingAddr: string | null;
   onCheck: (p: Position) => void;
+  onResume: (p: Position) => void;
   priceOf: (asset: string) => number;
   threshold: number;
   synced: boolean;
   wallet: string | null;
+  busy: boolean;
 }) {
   return (
     <div className="overflow-hidden rounded-2xl border border-[#131c30] bg-[#0b1120]">
@@ -805,14 +808,25 @@ function PositionsTable({
                     </div>
                   </td>
                   <td className="px-5 py-3.5 text-right">
-                    <button
-                      className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-40"
-                      onClick={() => onCheck(p)}
-                      disabled={checkingAddr !== null || !wallet}
-                      title={wallet ? 'Run the AI risk engine for this position' : 'Connect the wallet first'}
-                    >
-                      {checkingAddr === p.address ? 'Validators…' : 'Run Check()'}
-                    </button>
+                    {p.locked || /ACCOUNT_LOCKED/i.test(p.last_message) ? (
+                      <button
+                        className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[11px] font-semibold text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40"
+                        onClick={() => onResume(p)}
+                        disabled={busy || checkingAddr !== null || !wallet}
+                        title="Owner-only: clear the breach lock so the engine can check this position again"
+                      >
+                        {busy ? 'Working…' : 'Resume'}
+                      </button>
+                    ) : (
+                      <button
+                        className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-40"
+                        onClick={() => onCheck(p)}
+                        disabled={busy || checkingAddr !== null || !wallet}
+                        title={wallet ? 'Run the AI risk engine for this position' : 'Connect the wallet first'}
+                      >
+                        {checkingAddr === p.address ? 'Validators…' : 'Run Check()'}
+                      </button>
+                    )}
                     <div className="mt-1 text-[10px] text-slate-600">{p.last_checked}</div>
                   </td>
                 </tr>
@@ -1313,6 +1327,10 @@ export default function Page() {
           pushLog('info', 'Preview rows are disabled — add the position on-chain from the Accounts tab first');
           return;
         }
+        if (pos.locked || /ACCOUNT_LOCKED/i.test(pos.last_message)) {
+          pushLog('warn', `${short(target.address)} is locked after a breach — press Resume on its row first (owner only)`);
+          return;
+        }
 
         const before = await callView('get_position_status', [target.address]).catch(() => undefined);
         pushLog('ai', `check_and_protect(${short(target.address)}) → validators fetching ${target.collateral_asset} price, then LLM consensus…`);
@@ -1320,10 +1338,13 @@ export default function Page() {
         const outcome = await trackTx(hash);
 
         if (outcome.state === 'REVERTED') {
-          const hint = /PROTOCOL_PAUSED/i.test(outcome.revertReason ?? '')
+          const reason = outcome.revertReason ?? 'contract error';
+          const hint = /PROTOCOL_PAUSED/i.test(reason)
             ? ' — open Risk Engine and press Resume Protocol, then run the check again'
-            : '';
-          pushLog('error', `check_and_protect REVERTED on-chain: ${outcome.revertReason ?? 'contract error'}${hint}`, hash);
+            : /ACCOUNT_LOCKED/i.test(reason)
+              ? ' — this position is locked after its breach; the owner must press Resume on its row first'
+              : '';
+          pushLog('error', `check_and_protect REVERTED on-chain: ${reason}${hint}`, hash);
           await refreshProtocolState();
           return;
         }
@@ -1356,8 +1377,8 @@ export default function Page() {
           pushLog(level, outcome.output ?? fresh.last_message, hash);
           await refreshProtocolState();
           await refreshHistory();
-          if (effStatus === 'CRITICAL' && effRatio < liveThreshold) {
-            pushLog('error', 'CIRCUIT BREAKER ENGAGED — every further check() will revert until the owner resumes the protocol');
+          if (effStatus === 'CRITICAL') {
+            pushLog('error', 'POSITION LOCKED — further checks for it will revert until the owner presses Resume on its row');
           }
         } else if (outcome.output) {
           pushLog('success', outcome.output, hash);
@@ -1385,6 +1406,12 @@ export default function Page() {
       }
       if (!Number.isFinite(collateral) || collateral <= 0 || !Number.isFinite(debt) || debt <= 0) {
         pushLog('error', 'INVALID_AMOUNT — collateral and debt must be positive numbers');
+        return;
+      }
+      // this contract rejects duplicate addresses — pre-check so no gas is wasted
+      const exists = positions.some((x) => x.address.toLowerCase() === account.toLowerCase());
+      if (exists) {
+        pushLog('warn', `ALREADY_MONITORED — ${short(account)} is already registered on this contract. Use a different address, or run Check() on the existing row.`);
         return;
       }
       if (busy) return;
@@ -1424,7 +1451,7 @@ export default function Page() {
         setBusy(false);
       }
     },
-    [wallet, busy, connectWallet, pushLog, sendWrite, trackTx, upsertPosition, pollPosition],
+    [wallet, busy, connectWallet, pushLog, sendWrite, trackTx, upsertPosition, pollPosition, positions],
   );
 
   const resumeProtocol = useCallback(async () => {
@@ -1455,6 +1482,34 @@ export default function Page() {
       setBusy(false);
     }
   }, [busy, pushLog, sendWrite, trackTx, refreshProtocolState]);
+
+  const resumeAccount = useCallback(
+    async (pos: Position) => {
+      if (!wallet) {
+        pushLog('error', 'Connect the deployer wallet first');
+        return;
+      }
+      if (busy) return;
+      setBusy(true);
+      try {
+        const hash = await sendWrite('resume_account', [pos.address]);
+        const outcome = await trackTx(hash);
+        if (outcome.state === 'REVERTED') {
+          pushLog('error', `resume_account REVERTED on-chain: ${outcome.revertReason ?? 'contract error'}`, hash);
+          return;
+        }
+        pushLog('success', outcome.output ?? `ACCOUNT_RESUMED: ${short(pos.address)} unlocked — run Check() to re-evaluate`, hash);
+        void pollPosition(pos.address, 6, 3000).then((fresh) => {
+          if (fresh) upsertPosition(fresh, { force: true });
+        });
+      } catch (e: any) {
+        pushLog('error', `resume_account failed: ${e?.shortMessage ?? e?.message ?? e}`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [wallet, busy, pushLog, sendWrite, trackTx, upsertPosition, pollPosition],
+  );
 
   const updateThreshold = useCallback(
     async (value: number) => {
@@ -1548,7 +1603,7 @@ export default function Page() {
   const checkEvents = useMemo(() => history.filter((h) => (h.type ?? 'CHECK') === 'CHECK'), [history]);
 
   const onChainEvents = useMemo(() => {
-    const evts: { kind: 'ADD' | 'CHECK'; seq: number; account: string; status: string; detail: string }[] = [];
+    const evts: { kind: 'ADD' | 'CHECK' | 'RESUME'; seq: number; account: string; status: string; detail: string }[] = [];
     for (const h of [...history].reverse()) {
       if (h.type === 'ADD') {
         evts.push({
@@ -1557,6 +1612,14 @@ export default function Page() {
           account: h.account,
           status: 'SAFE',
           detail: `${h.collateral_amount} ${h.asset} added vs ${h.debt_amount} ${h.debt_asset ?? 'USDT'} debt`,
+        });
+      } else if (h.type === 'RESUME_ACCOUNT') {
+        evts.push({
+          kind: 'RESUME',
+          seq: 0,
+          account: h.account,
+          status: 'SAFE',
+          detail: h.message,
         });
       } else {
         evts.push({
@@ -1577,76 +1640,18 @@ export default function Page() {
       txByAccount={txByAccount}
       checkingAddr={checkingAddr}
       onCheck={(p) => void runCheck(p)}
+      onResume={(p) => void resumeAccount(p)}
       priceOf={priceOf}
       threshold={liveThreshold}
       synced={synced}
       wallet={wallet}
+      busy={busy}
     />
   );
 
   return (
     <div className="flex min-h-screen bg-[#070b14] text-slate-200">
       <Sidebar wallet={wallet} tab={tab} onTab={setTab} />
-
-      {/* Engine Activity dock — fixed viewport height with internal scroll, so the
-          page length never grows no matter how many log entries are added. */}
-      <div
-        className={`sticky top-0 hidden h-screen shrink-0 flex-col overflow-hidden border-r border-[#131c30] bg-[#090e1a] transition-all duration-200 lg:flex ${
-          activityOpen ? 'w-80' : 'w-12'
-        }`}
-      >
-        {activityOpen ? (
-          <>
-            <div className="flex items-center justify-between border-b border-[#131c30] px-3 py-3">
-              <div className="flex items-center gap-2">
-                <span className="flex h-5 w-5 items-center justify-center rounded-md bg-cyan-500/15">
-                  <svg viewBox="0 0 24 24" className="h-3 w-3 text-cyan-400" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M4 6h16M4 12h10M4 18h7" strokeLinecap="round" />
-                  </svg>
-                </span>
-                <span className="text-[11px] font-semibold uppercase tracking-widest text-slate-300">Engine Activity</span>
-                {logs.length > 0 && (
-                  <span className="rounded-full border border-[#1e293b] px-1.5 py-0.5 text-[9px] text-slate-500">{logs.length}</span>
-                )}
-              </div>
-              <div className="flex items-center gap-1.5">
-                <button
-                  className="rounded-md border border-[#1e293b] px-2 py-1 text-[10px] text-slate-500 hover:text-slate-300"
-                  onClick={() => setLogs([])}
-                >
-                  Clear
-                </button>
-                <button
-                  className="rounded-md p-1 text-slate-500 hover:text-slate-300"
-                  title="Minimize to rail"
-                  onClick={() => setActivityOpen(false)}
-                >
-                  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M15 19l-7-7 7-7" strokeLinecap="round" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-            <div className="border-b border-[#0e1526] px-3 py-2">
-              <ActivityFilters filter={activityFilter} onFilter={setActivityFilter} />
-            </div>
-            <ActivityFeedBody logs={logs} filter={activityFilter} scrollRef={termRef} />
-          </>
-        ) : (
-          <button
-            className="flex h-full w-12 flex-col items-center gap-3 py-4 hover:bg-[#0d1526]"
-            onClick={() => setActivityOpen(true)}
-            title="Open Engine Activity"
-          >
-            <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 text-slate-500" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M9 5l7 7-7 7" strokeLinecap="round" />
-            </svg>
-            <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-500" style={{ writingMode: 'vertical-rl' }}>
-              Engine Activity{logs.length > 0 ? ` · ${logs.length}` : ''}
-            </span>
-          </button>
-        )}
-      </div>
 
       <main className="min-w-0 flex-1">
         {/* header */}
@@ -1703,8 +1708,8 @@ export default function Page() {
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3">
               <div className="flex items-center gap-3 text-sm text-rose-300">
                 <span className="h-2 w-2 animate-ping rounded-full bg-rose-400" />
-                <span className="font-semibold">Circuit breaker active</span>
-                <span className="text-rose-300/70">— a collateral ratio breached {liveThreshold}%; all checks revert until resumed.</span>
+                <span className="font-semibold">Emergency stop active</span>
+                <span className="text-rose-300/70">— the owner paused the protocol; every check reverts until resumed.</span>
               </div>
               <button
                 className="rounded-lg border border-rose-500/40 px-3 py-1.5 text-xs font-semibold text-rose-300 hover:bg-rose-500/10 disabled:opacity-50"
@@ -1882,7 +1887,7 @@ export default function Page() {
                 <div className="mb-4 text-sm font-medium text-slate-300">Protocol State (on-chain)</div>
                 <dl className="space-y-3 text-xs">
                   {[
-                    ['Circuit breaker', paused ? 'ENGAGED — protocol paused' : synced ? 'disengaged — operational' : 'syncing…'],
+                    ['Emergency stop', paused ? 'ENGAGED — protocol paused' : synced ? 'disengaged — operational' : 'syncing…'],
                     ['Safety threshold', `${liveThreshold}%`],
                     ['Consensus checks run', protocol ? String(asNum(protocol.total_checks)) : '—'],
                     ['Owner (can resume)', protocol?.owner ? short(protocol.owner) : '—'],
@@ -1983,14 +1988,16 @@ export default function Page() {
                           className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
                             ev.kind === 'ADD'
                               ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
-                              : ev.status === 'CRITICAL'
-                                ? 'border-rose-500/30 bg-rose-500/10 text-rose-300'
-                                : ev.status === 'WARNING'
-                                  ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
-                                  : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                              : ev.kind === 'RESUME'
+                                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                : ev.status === 'CRITICAL'
+                                  ? 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+                                  : ev.status === 'WARNING'
+                                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                    : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
                           }`}
                         >
-                          {ev.kind === 'ADD' ? 'ADDED' : `CHECK #${ev.seq}`}
+                          {ev.kind === 'ADD' ? 'ADDED' : ev.kind === 'RESUME' ? 'RESUMED' : `CHECK #${ev.seq}`}
                         </span>
                         <span className="font-mono text-slate-300">{short(ev.account)}</span>
                         <span className="min-w-0 flex-1 truncate text-slate-400" title={ev.detail}>
@@ -2109,9 +2116,69 @@ export default function Page() {
         </div>
       </main>
 
-      {/* mobile: floating activity button + slide-over drawer */}
+      {/* Engine Activity dock — RIGHT side, fixed viewport height with internal
+          scroll, visible on every tab. Minimizes to a slim vertical rail. */}
+      <div
+        className={`sticky top-0 hidden h-screen shrink-0 flex-col overflow-hidden border-l border-[#131c30] bg-[#090e1a] transition-all duration-200 lg:flex ${
+          activityOpen ? 'w-80' : 'w-12'
+        }`}
+      >
+        {activityOpen ? (
+          <>
+            <div className="flex items-center justify-between border-b border-[#131c30] px-3 py-3">
+              <div className="flex items-center gap-2">
+                <span className="flex h-5 w-5 items-center justify-center rounded-md bg-cyan-500/15">
+                  <svg viewBox="0 0 24 24" className="h-3 w-3 text-cyan-400" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M4 6h16M4 12h10M4 18h7" strokeLinecap="round" />
+                  </svg>
+                </span>
+                <span className="text-[11px] font-semibold uppercase tracking-widest text-slate-300">Engine Activity</span>
+                {logs.length > 0 && (
+                  <span className="rounded-full border border-[#1e293b] px-1.5 py-0.5 text-[9px] text-slate-500">{logs.length}</span>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  className="rounded-md border border-[#1e293b] px-2 py-1 text-[10px] text-slate-500 hover:text-slate-300"
+                  onClick={() => setLogs([])}
+                >
+                  Clear
+                </button>
+                <button
+                  className="rounded-md p-1 text-slate-500 hover:text-slate-300"
+                  title="Minimize to rail"
+                  onClick={() => setActivityOpen(false)}
+                >
+                  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M9 5l7 7-7 7" strokeLinecap="round" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div className="border-b border-[#0e1526] px-3 py-2">
+              <ActivityFilters filter={activityFilter} onFilter={setActivityFilter} />
+            </div>
+            <ActivityFeedBody logs={logs} filter={activityFilter} scrollRef={termRef} />
+          </>
+        ) : (
+          <button
+            className="flex h-full w-12 flex-col items-center gap-3 py-4 hover:bg-[#0d1526]"
+            onClick={() => setActivityOpen(true)}
+            title="Open Engine Activity"
+          >
+            <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 text-slate-500" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M15 19l-7-7 7-7" strokeLinecap="round" />
+            </svg>
+            <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-500" style={{ writingMode: 'vertical-rl' }}>
+              Engine Activity{logs.length > 0 ? ` · ${logs.length}` : ''}
+            </span>
+          </button>
+        )}
+      </div>
+
+      {/* mobile: floating activity button (right side) + slide-over drawer */}
       <button
-        className="fixed bottom-4 left-4 z-40 flex h-12 w-12 items-center justify-center rounded-full border border-cyan-500/40 bg-[#0d1526] text-cyan-300 shadow-lg lg:hidden"
+        className="fixed bottom-4 right-4 z-40 flex h-12 w-12 items-center justify-center rounded-full border border-cyan-500/40 bg-[#0d1526] text-cyan-300 shadow-lg lg:hidden"
         onClick={() => setActivityMobileOpen(true)}
         title="Engine Activity"
       >
@@ -2127,7 +2194,7 @@ export default function Page() {
         <div className="fixed inset-0 z-50 lg:hidden" onClick={() => setActivityMobileOpen(false)}>
           <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
           <div
-            className="absolute left-0 top-0 flex h-full w-80 max-w-[85vw] flex-col border-r border-[#131c30] bg-[#090e1a]"
+            className="absolute right-0 top-0 flex h-full w-80 max-w-[85vw] flex-col border-l border-[#131c30] bg-[#090e1a]"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-[#131c30] px-3 py-3">
